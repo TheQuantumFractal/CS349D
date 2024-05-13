@@ -35,21 +35,29 @@ def eep(rank):
     leader = 0
     process_group = dist.distributed_c10d._get_default_group()
     ranks = dist.get_process_group_ranks(process_group)
-    process_group = dist.new_group(ranks=ranks, timeout=timedelta(milliseconds=100))
+    process_group = dist.new_group(ranks=ranks, timeout=timedelta(milliseconds=200))
 
-    if rank != size - 1:
+    if rank != 3:
         try:
             dist.all_reduce(t, group=process_group, op=dist.ReduceOp.SUM)
         except:
             a = torch.zeros(size)
             a[rank] = 1
             if rank != leader:
-                dist.send(a, dst=leader, group=process_group)
-                time.sleep(0.1)
-                dist.recv(a, src=leader, group=process_group)
-                indices = torch.where(a == 1)[0]
-                process_group = dist.new_group(ranks=indices, timeout=timedelta(seconds=2))
-                dist.all_reduce(t, group=process_group, op=dist.ReduceOp.SUM)
+                try:
+                    dist.send(a, dst=leader, group=process_group)
+                    time.sleep(0.1)
+                    dist.recv(a, src=leader, group=process_group)
+                    indices = torch.where(a == 1)[0]
+                    process_group = dist.new_group(ranks=indices, timeout=timedelta(seconds=2))
+                    dist.all_reduce(t, group=process_group, op=dist.ReduceOp.SUM)
+                except:
+                    # Leader has died. Create new leader
+                    ranks.remove(leader)
+                    leader = ranks[0]
+                    process_group = dist.new_group(ranks=ranks, timeout=timedelta(seconds=2))
+                    t = torch.ones(1)
+                    dist.all_reduce(t, group=process_group, op=dist.ReduceOp.SUM)
             else:
                 for i in range(size):
                     if i != leader:
@@ -64,6 +72,7 @@ def eep(rank):
                     if i != leader:
                         dist.send(a, dst=i, group=process_group)
                 process_group = dist.new_group(ranks=indices, timeout=timedelta(seconds=2))
+                t = torch.ones(1)
                 dist.all_reduce(t, group=process_group, op=dist.ReduceOp.SUM)
         print(t)
         logging.info(f"Rank {rank} great success!")
