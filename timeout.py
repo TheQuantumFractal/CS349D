@@ -20,28 +20,32 @@ logging.basicConfig(
 )
 
 
-def single_node_setup(backend, device, rank, world_size):
-    if device == "cuda":
-        torch.cuda.set_device(rank)
+def setup(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "32420"
-    timeout = timedelta(seconds=2)
-    dist.init_process_group(backend, rank=rank, world_size=world_size, timeout=timeout)
 
-size = 4
-def eep(rank):
-    single_node_setup("gloo", "cpu", rank, size)
-    t = torch.ones(1)
+    timeout = timedelta(seconds=2)
+    dist.init_process_group("gloo", rank=rank, world_size=world_size, timeout=timeout)
+
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    return device
+
+
+def eep(rank, world_size):
+    device = setup(rank, world_size)
+    # dummy data
+    t = torch.ones(1, device=device)
+
     leader = 0
     process_group = dist.distributed_c10d._get_default_group()
     ranks = dist.get_process_group_ranks(process_group)
     process_group = dist.new_group(ranks=ranks, timeout=timedelta(milliseconds=200))
 
-    if rank != 3:
+    if rank != 0:
         try:
             dist.all_reduce(t, group=process_group, op=dist.ReduceOp.SUM)
         except:
-            a = torch.zeros(size)
+            a = torch.zeros(world_size)
             a[rank] = 1
             if rank != leader:
                 try:
@@ -55,14 +59,15 @@ def eep(rank):
                     # Leader has died. Create new leader
                     ranks.remove(leader)
                     leader = ranks[0]
+                    logging.info(f"The leader has died. Rank {rank} is the new leader.")
                     process_group = dist.new_group(ranks=ranks, timeout=timedelta(seconds=2))
                     t = torch.ones(1)
                     dist.all_reduce(t, group=process_group, op=dist.ReduceOp.SUM)
             else:
-                for i in range(size):
+                for i in range(world_size):
                     if i != leader:
                         try:
-                            tmp = torch.zeros(size)
+                            tmp = torch.zeros(world_size)
                             dist.recv(tmp, src=i, group=process_group)
                             a += tmp
                         except:
@@ -84,9 +89,10 @@ def eep(rank):
 
 
 if __name__ == "__main__":
+    world_size = 2
     mp.spawn(
         fn=eep,
-        args=(),
-        nprocs=size,
+        args=(world_size,),
+        nprocs=world_size,
         join=True,
     )
