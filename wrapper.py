@@ -14,6 +14,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+MINUNIT = 0.5
+TIMEOUT = 1200
 
 class DDPNoStop(torch.nn.Module):
     """
@@ -59,6 +61,7 @@ class DDPNoStop(torch.nn.Module):
             self.fault_recovery()
 
     def fault_recovery(self):
+        t = time.time()
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         process_group = dist.distributed_c10d._get_default_group()
@@ -67,38 +70,57 @@ class DDPNoStop(torch.nn.Module):
 
         alive = torch.zeros(len(ranks))
         alive[rank] = 1
+        # logging.error("WOO")
+
 
         if rank != self.leader:
-            try:
-                dist.send(alive, dst=self.leader)
-                time.sleep(2)
-                dist.recv(alive, src=self.leader)
-                indices = torch.where(alive == 1)[0].tolist()
-                my_rank = indices.index(rank)
-                print(f"I was previously {rank} but I am now {my_rank}.")
-                dist.distributed_c10d.destroy_process_group()
-                dist.init_process_group("gloo", rank=my_rank, world_size=world_size-1, timeout=timedelta(seconds=2))
-            except:
-                # Leader has died. Create new leader
-                ranks.remove(self.leader)
-                my_rank = ranks.index(rank)
-                print(f"The leader has died. I was previously {rank} but I am now {my_rank}.")
-                dist.distributed_c10d.destroy_process_group()
-                dist.init_process_group("gloo", rank=my_rank, world_size=world_size-1, timeout=timedelta(seconds=2))
-        else:
-            for i in range(world_size):
-                if i != self.leader:
-                    try:
-                        tmp = torch.zeros(world_size)
-                        dist.recv(tmp, src=i)
-                        alive += tmp
-                    except:
-                        continue
+            # logging.error("WOO1")
+            handle = dist.isend(alive, dst=self.leader)
+            # t = time.time()
+            # print((t - time.time()))
+            # time.sleep(world_size * MINUNIT - (t - time.time())/1000)
+            handle.wait(timeout=timedelta(milliseconds=TIMEOUT))
+            logging.error("WOO2")
+            # time.sleep(1 * world_size)
+            # time.sleep(0.01)
+            dist.recv(alive, src=self.leader)
+            print(alive)
+            # t = time.time()
+            logging.error("WOO5")
             indices = torch.where(alive == 1)[0].tolist()
             my_rank = indices.index(rank)
+            print(f"I was previously {rank} but I am now {my_rank}.")
+            dist.distributed_c10d.destroy_process_group()
+            dist.init_process_group("gloo", rank=my_rank, world_size=world_size-1, timeout=timedelta(seconds=2))
+        else:
+            arr_op = [torch.zeros(world_size) for _ in range(world_size)]
+            handles = []
+            for i in range(world_size):
+                if i != self.leader:
+                    handles.append(dist.irecv(arr_op[i], src=i))
+            # logging.error("WOo3")
+            # t = time.time()
+            for handle in handles:
+                try:
+                    handle.wait(timeout=timedelta(milliseconds=TIMEOUT))
+                except:
+                    continue
+            for op in arr_op:
+                alive += op
+            # print(time.time())
+            print((t - time.time()))
+            # time.sleep(0.1)
+            # time.sleep(world_size * MINUNIT - (t - time.time())/1000)
+            logging.error("WOO4")
+            indices = torch.where(alive == 1)[0].tolist()
+            my_rank = indices.index(rank)
+            handles = []
             for i in indices:
                 if i != self.leader:
                     dist.send(alive, dst=i)
+            # t = time.time()
+            # time.sleep(world_size * 2 * MINUNIT - (t - time.time()))
+                    # handle.wait(timeout=timedelta(milliseconds=1000))
             print(f"I am the leader. I was previously {rank} but I am now {my_rank}.")
             dist.distributed_c10d.destroy_process_group()
             dist.init_process_group("gloo", rank=my_rank, world_size=world_size-1, timeout=timedelta(seconds=2))
@@ -142,10 +164,10 @@ def train(rank, world_size, model):
         start = timeit.default_timer()
         _train_step()
 
-        if rank == 2 and iter == 20:
+        if rank == 1 and iter == 20:
             # simulate a fault
             os._exit(0)
-        
+    
         bench_times.append(timeit.default_timer() - start)
     
     print(f"Rank {rank} time per iteration: {torch.tensor(bench_times).mean()} ± {torch.tensor(bench_times).std()}")
@@ -153,6 +175,6 @@ def train(rank, world_size, model):
 
 
 if __name__ == "__main__":
-    world_size = 3
+    world_size = 5
     model = torch.nn.Linear(10, 10)
     mp.spawn(train, args=(world_size, model), nprocs=world_size)

@@ -1,8 +1,8 @@
 import random
 import numpy as np
 
-devices = 10000
-failure_prob  = 3.7e-6 # probability of single GPU failure in 10 minute interval
+devices = 10000//25
+failure_prob  = 3.7e-6*25 # probability of single GPU failure in 10 minute interval
 recovery_time = 3 # in 10s of minutes
 iteration_time = 1 # in 10s of minutes
 MAX_ITERATIONS = 4000
@@ -12,10 +12,14 @@ def simulate():
     batches_completed = 0
     state = np.ones(devices)
     failure_times = np.zeros_like(state)
-    for t in range(MAX_ITERATIONS):
+    t = 0
+    while t < MAX_ITERATIONS:
         state = failure_times <= 0
         failure = (np.random.rand(devices) < failure_prob)*state
         state = np.logical_and(state, 1 - failure)
+        if np.sum(failure) > 0:
+            t += recovery_time
+        t += iteration_time
         failure_times += failure*recovery_time
         failure_times -= 1
         failure_times = np.maximum(failure_times, 0)
