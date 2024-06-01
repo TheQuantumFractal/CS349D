@@ -7,12 +7,11 @@ basically the code in timeout.py but as a torch.nn.Module wrapper
 import os
 import time
 import logging
-import timeit # more accurate than time
 from datetime import timedelta
 
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
+
 
 
 class DDPNoStop(torch.nn.Module):
@@ -105,54 +104,3 @@ class DDPNoStop(torch.nn.Module):
         
             logging.info("The system experienced a fault and successfully recovered.")
         self.broadcast_params(async_op=True)
-
-def _setup_dist(rank, world_size):
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "32420"
-
-    timeout = timedelta(seconds=2)
-    dist.init_process_group("gloo", rank=rank, world_size=world_size, timeout=timeout)
-
-    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
-    return device
-
-def train(rank, world_size, model):
-    """
-    boilerplate training loop
-    """
-    device = _setup_dist(rank, world_size)
-    model = DDPNoStop(model).to(device)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
-    criterion = torch.nn.CrossEntropyLoss()
-
-    # keep the same data for benchmarking 
-    x = torch.randn(10, 10).to(device)
-    y= torch.randint(0, 10, (10,)).to(device)
-
-    def _train_step():
-        optimizer.zero_grad()
-        output = model(x)
-        loss = criterion(output, y)
-        loss.backward()
-        model.finish_gradient_synchronization()
-        optimizer.step()
-
-    bench_times = []
-    for iter in range(100):
-        start = timeit.default_timer()
-        _train_step()
-
-        if rank == 2 and iter == 20:
-            # simulate a fault
-            os._exit(0)
-        
-        bench_times.append(timeit.default_timer() - start)
-    
-    print(f"Rank {rank} time per iteration: {torch.tensor(bench_times).mean()} ± {torch.tensor(bench_times).std()}")
-    
-
-
-if __name__ == "__main__":
-    world_size = 3
-    model = torch.nn.Linear(10, 10)
-    mp.spawn(train, args=(world_size, model), nprocs=world_size)
