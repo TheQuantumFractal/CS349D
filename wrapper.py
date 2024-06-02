@@ -69,6 +69,12 @@ class DDPNoStop(torch.nn.Module):
         except: # timeout
             self.fault_recovery()
 
+    def _update_process_group(self, my_rank, world_size):
+        dist.distributed_c10d.destroy_process_group()
+        dist.init_process_group("gloo", rank=my_rank, world_size=world_size, timeout=timedelta(seconds=self.comm_time * world_size))
+        os.environ["MASTER_PORT"] = str(int(os.environ["MASTER_PORT"]) + 1)
+        dist.barrier(timeout=timedelta(seconds=self.comm_time))
+
     def fault_recovery(self):
         rank = dist.get_rank()
         logging.error(f"Rank {rank} detected a fault. Attempting to recover...")
@@ -93,9 +99,7 @@ class DDPNoStop(torch.nn.Module):
                         world_size -= 1
                     my_rank = indices.index(rank)
                     logging.info(f"I was previously {rank} but I am now {my_rank}.")
-                    dist.distributed_c10d.destroy_process_group()
-                    logging.info(f"creating process: rank={my_rank}, world_size={world_size}")
-                    dist.init_process_group("gloo", rank=my_rank, world_size=world_size, timeout=timedelta(seconds=self.comm_time * world_size))
+                    self._update_process_group(my_rank, world_size)
                     break
                 except RuntimeError:    # timeout
                     # Leader has died. Create new leader
@@ -103,8 +107,7 @@ class DDPNoStop(torch.nn.Module):
                     ranks.remove(len(ranks)-1)
                     my_rank = rank - 1
                     logging.info(f"The leader has died. I was previously {rank} but I am now {my_rank}.")
-                    dist.distributed_c10d.destroy_process_group()
-                    dist.init_process_group("gloo", rank=my_rank, world_size=world_size, timeout=timedelta(seconds=self.comm_time * world_size))
+                    self._update_process_group(my_rank, world_size)
             else:   # leader branch
                 arr_op = [torch.zeros(world_size) for _ in range(world_size)]
                 handles = []
@@ -135,9 +138,7 @@ class DDPNoStop(torch.nn.Module):
                 for i in indices:
                     if i != self.leader:
                         dist.send(alive, dst=i)
-                dist.distributed_c10d.destroy_process_group()
-                logging.info(f"creating process: rank={my_rank}, world_size={world_size}")
-                dist.init_process_group("gloo", rank=my_rank, world_size=world_size, timeout=timedelta(seconds=self.comm_time * world_size))
+                self._update_process_group(my_rank, world_size)
                 break
         
         logging.info("The system experienced a fault and successfully recovered.")
