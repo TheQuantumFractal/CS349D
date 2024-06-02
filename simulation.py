@@ -4,49 +4,62 @@ file: simulation.py
 simulates training loop and faults
 """
 import os
-import hashlib
-import torch
+import logging
 import timeit # more accurate than time
 from datetime import timedelta
+import numpy as np
+import torch
 import torch.multiprocessing as mp
 import torch.distributed as dist
+from tqdm import tqdm
 
 from wrapper import DDPNoStop
 
-GLOBAL_P_FAIL = 0 # 1e-5
+WORLD_SIZE = 5
+MAX_ITERS = 100
+GLOBAL_P_FAIL = 0.1
+FAULT_SEED = None   # 0 for no faults, None for random seed
+
+
+# logging
+if 1:
+    logging.basicConfig(level=logging.INFO)
 
 class FaultSimulator:
-    def __init__(self, p_fail, rank):
+    def __init__(self, p_fail, seed=None):
         assert 0 <= p_fail <= 1, "p_fail must be between 0 and 1"
         self.p_fail = p_fail
-        self.rank = rank
-        # seed hash fn with rank
-        self.sha256 = hashlib.sha256(str(rank).encode())
+        self.fault_counter = 0
+        if seed is None:    # None - random seed
+            seed = torch.randint(0, 2**32, (1,)).item()
+        self.seed = seed    # 0 - no faults
+        np.random.seed(seed)
+        logging.info(f"Fault simulator initialized with p_fail={p_fail} and seed={seed}")
 
     def __call__(self, iter):
-        self.sha256.update(str(iter).encode())
-        return int(self.sha256.hexdigest(), 16) % 100 < self.p_fail * 100
+        if self.seed != 0 and np.random.rand() < self.p_fail:
+            self.fault_counter += 1
+            return True
+        return False
 
 
 def _setup_dist(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "32420"
+    os.environ["MASTER_PORT"] = "20420"
 
     timeout = timedelta(seconds=2)
     dist.init_process_group("gloo", rank=rank, world_size=world_size, timeout=timeout)
 
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
 
-    fault_sim = FaultSimulator(GLOBAL_P_FAIL, rank)
-
-    return device, fault_sim
+    return device
 
 
-def train(rank, world_size, model):
+def train(rank, world_size, model, fault_sim):
     """
     boilerplate training loop
     """
-    device, fault_sim = _setup_dist(rank, world_size)
+    device = _setup_dist(rank, world_size)
     model = DDPNoStop(model).to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
     criterion = torch.nn.CrossEntropyLoss()
@@ -64,22 +77,25 @@ def train(rank, world_size, model):
         optimizer.step()
 
     bench_times = []
-    for iter in range(100):
+    for iter in range(MAX_ITERS):
         start = timeit.default_timer()
         _train_step()
 
         if fault_sim(iter):
             # simulate a fault
-            logging.error(f"Rank {rank} experienced a fault at iteration {iter}.")
+            fault_sim.fault_counter += 1
+            logging.error(f"Simulated fault in rank {rank} iteration {iter}.")
             os._exit(0)
         
         bench_times.append(timeit.default_timer() - start)
     
-    print(f"Rank {rank} time per iteration: {torch.tensor(bench_times).mean()} ± {torch.tensor(bench_times).std()}")
+    logging.info(f"Rank {rank} time per iteration: {torch.tensor(bench_times).mean()} ± {torch.tensor(bench_times).std()}")
     
 
 
 if __name__ == "__main__":
-    world_size = 3
+    world_size = WORLD_SIZE
     model = torch.nn.Linear(10, 10)
-    mp.spawn(train, args=(world_size, model), nprocs=world_size)
+    fault_sim = FaultSimulator(GLOBAL_P_FAIL, FAULT_SEED)
+    mp.spawn(train, args=(world_size, model, fault_sim), nprocs=world_size)
+    print("Total faults: ", fault_sim.fault_counter)

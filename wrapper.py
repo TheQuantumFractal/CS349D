@@ -8,7 +8,7 @@ import os
 import time
 import logging
 from datetime import timedelta
-
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -30,11 +30,24 @@ class DDPNoStop(torch.nn.Module):
                 param.register_hook(self._sync_gradients_hook)
         self.handles = []
 
+        # adjusts sensitivy of timeout (sec)
+        self.comm_time = 25 * self.benchmark_comm() # multiply by arbitrary constant
+
         dist.barrier()
 
     def broadcast_params(self, async_op):
         for param in self.module.parameters():
             dist.broadcast(param.data, self.leader, async_op=async_op)
+
+    def benchmark_comm(self):
+        comm_times = []
+        for _ in range(100):
+            t = time.time()
+            for param in self.module.parameters():
+                dist.all_reduce(param.data, op=dist.ReduceOp.SUM)
+            dist.barrier()
+            comm_times.append(time.time() - t)
+        return np.mean(comm_times) * 1000
 
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
@@ -54,53 +67,78 @@ class DDPNoStop(torch.nn.Module):
             dist.barrier()
 
         except: # timeout
-            logging.error("The system experienced a fault. Attempting to recover.")
             self.fault_recovery()
 
     def fault_recovery(self):
         rank = dist.get_rank()
+        logging.error(f"Rank {rank} detected a fault. Attempting to recover...")
         world_size = dist.get_world_size()
         process_group = dist.distributed_c10d._get_default_group()
         ranks = dist.get_process_group_ranks(process_group)
-        # dist.distributed_c10d._set_pg_timeout(timedelta(milliseconds=200), process_group)
 
         alive = torch.zeros(len(ranks))
         alive[rank] = 1
 
-        if rank != self.leader:
-            try:
-                dist.send(alive, dst=self.leader)
-                time.sleep(2)
-                dist.recv(alive, src=self.leader)
-                indices = torch.where(alive == 1)[0].tolist()
-                my_rank = indices.index(rank)
-                print(f"I was previously {rank} but I am now {my_rank}.")
-                dist.distributed_c10d.destroy_process_group()
-                dist.init_process_group("gloo", rank=my_rank, world_size=world_size-1, timeout=timedelta(seconds=2))
-            except:
-                # Leader has died. Create new leader
-                ranks.remove(self.leader)
-                my_rank = ranks.index(rank)
-                print(f"The leader has died. I was previously {rank} but I am now {my_rank}.")
-                dist.distributed_c10d.destroy_process_group()
-                dist.init_process_group("gloo", rank=my_rank, world_size=world_size-1, timeout=timedelta(seconds=2))
-        else:
-            for i in range(world_size):
-                if i != self.leader:
+        while len(ranks) > 1:   # repeat leader election until undead leader is found
+            if rank != self.leader:
+                try:
+                    handle = dist.isend(alive, dst=self.leader)
+                    handle.wait(timeout=timedelta(seconds=self.comm_time))
+                    dist.recv(alive, src=self.leader)
+                    indices = torch.where(alive == 1)[0].tolist()
+
+                    # world_size-len(indices) processes have died
+                    for i in range(world_size-len(indices)):
+                        ranks.remove(len(ranks)-1)
+                        world_size -= 1
+                    my_rank = indices.index(rank)
+                    logging.info(f"I was previously {rank} but I am now {my_rank}.")
+                    dist.distributed_c10d.destroy_process_group()
+                    logging.info(f"creating process: rank={my_rank}, world_size={world_size}")
+                    dist.init_process_group("gloo", rank=my_rank, world_size=world_size, timeout=timedelta(seconds=self.comm_time * world_size))
+                    break
+                except RuntimeError:    # timeout
+                    # Leader has died. Create new leader
+                    world_size -= 1
+                    ranks.remove(len(ranks)-1)
+                    my_rank = rank - 1
+                    logging.info(f"The leader has died. I was previously {rank} but I am now {my_rank}.")
+                    dist.distributed_c10d.destroy_process_group()
+                    dist.init_process_group("gloo", rank=my_rank, world_size=world_size, timeout=timedelta(seconds=self.comm_time * world_size))
+            else:   # leader branch
+                arr_op = [torch.zeros(world_size) for _ in range(world_size)]
+                handles = []
+                for i in range(dist.get_world_size()):
+                    if i != self.leader:
+                        try:
+                            handle = dist.irecv(arr_op[i], src=i)
+                            handles.append(handle)
+                        except:
+                            # RuntimeError: Connection closed by peer
+                            continue
+                for handle in handles:
                     try:
-                        tmp = torch.zeros(world_size)
-                        dist.recv(tmp, src=i)
-                        alive += tmp
+                        handle.wait(timeout=timedelta(seconds=self.comm_time))
                     except:
                         continue
-            indices = torch.where(alive == 1)[0].tolist()
-            my_rank = indices.index(rank)
-            for i in indices:
-                if i != self.leader:
-                    dist.send(alive, dst=i)
-            print(f"I am the leader. I was previously {rank} but I am now {my_rank}.")
-            dist.distributed_c10d.destroy_process_group()
-            dist.init_process_group("gloo", rank=my_rank, world_size=world_size-1, timeout=timedelta(seconds=2))
+                for op in arr_op:
+                    alive += op
+                indices = torch.where(alive == 1)[0].tolist()
+
+                # world_size-len(indices) processes have died
+                for i in range(world_size-len(indices)):
+                    ranks.remove(len(ranks)-1)
+                    world_size -= 1
+                my_rank = 0   # leader is always rank 0
+                logging.info(f"I am the leader. I was previously {rank} but I am now {my_rank}.")
+                handles = []
+                for i in indices:
+                    if i != self.leader:
+                        dist.send(alive, dst=i)
+                dist.distributed_c10d.destroy_process_group()
+                logging.info(f"creating process: rank={my_rank}, world_size={world_size}")
+                dist.init_process_group("gloo", rank=my_rank, world_size=world_size, timeout=timedelta(seconds=self.comm_time * world_size))
+                break
         
-            logging.info("The system experienced a fault and successfully recovered.")
+        logging.info("The system experienced a fault and successfully recovered.")
         self.broadcast_params(async_op=True)
