@@ -59,17 +59,28 @@ class DDPNoStop(torch.nn.Module):
             handle = dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM, async_op=True)
             self.handles.append((handle, param.grad))
     
-    def finish_gradient_synchronization(self):
+    def finish_gradient_synchronization(self, failed_end, leader_end, isFailed):
+        if isFailed:
+            logging.info(f"printing handles:")
+            logging.info(self.handles)
         try:
             for handle, grad in reversed(self.handles):
+                if isFailed:
+                    logging.info("waiting")
                 handle.wait()
                 grad /= self.world_size
             
+            if isFailed:
+                logging.info("clearing")
             self.handles.clear()
+            if isFailed:
+                logging.info("is barriering")
             dist.barrier()
 
         except: # timeout
-            self.fault_recovery()
+            if isFailed:
+                logging.error("FAULT RECOVERY OF JOE MOTHA")
+            self.fault_recovery(failed_end, leader_end)
 
     def _update_process_group(self, my_rank, world_size):
         dist.distributed_c10d.destroy_process_group()
@@ -78,7 +89,7 @@ class DDPNoStop(torch.nn.Module):
         # dist.monitored_barrier(timeout=timedelta(seconds=self.comm_time))
         dist.barrier()
 
-    def fault_recovery(self):
+    def fault_recovery(self, failed_end, leader_end):
         rank = dist.get_rank()
         logging.error(f"Rank {rank} detected a fault. Attempting to recover...")
         world_size = dist.get_world_size()

@@ -12,6 +12,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.distributed as dist
 from tqdm import tqdm
+import time
 
 from wrapper import DDPNoStop
 
@@ -55,7 +56,7 @@ def _setup_dist(rank, world_size):
     return device
 
 
-def train(rank, world_size, model, fault_sim):
+def train(rank, world_size, model, fault_sim, failed_end, leader_end):
     """
     boilerplate training loop
     """
@@ -73,7 +74,7 @@ def train(rank, world_size, model, fault_sim):
         output = model(x)
         loss = criterion(output, y)
         loss.backward()
-        model.finish_gradient_synchronization()
+        model.finish_gradient_synchronization(failed_end, leader_end, False)
         optimizer.step()
 
     bench_times = []
@@ -85,8 +86,20 @@ def train(rank, world_size, model, fault_sim):
             # simulate a fault
             fault_sim.fault_counter += 1
             logging.error(f"Simulated fault in rank {rank} iteration {iter}.")
-            os._exit(0)
-        
+            time.sleep(10)
+            logging.info('back online, trying train step now')
+            logging.info('running train step')
+            optimizer.zero_grad()
+            logging.info('running model')
+            output = model(x)
+            logging.info('running loss')
+            loss = criterion(output, y)
+            loss.backward()
+            logging.info('finishing gradient sync')
+            model.finish_gradient_synchronization(failed_end, leader_end, True)
+            logging.info('stepping optimizer')
+            optimizer.step()
+            
         bench_times.append(timeit.default_timer() - start)
     
     logging.info(f"Rank {rank} time per iteration: {torch.tensor(bench_times).mean()} ± {torch.tensor(bench_times).std()}")
@@ -97,5 +110,6 @@ if __name__ == "__main__":
     world_size = WORLD_SIZE
     model = torch.nn.Linear(10, 10)
     fault_sim = FaultSimulator(GLOBAL_P_FAIL, FAULT_SEED)
-    mp.spawn(train, args=(world_size, model, fault_sim), nprocs=world_size)
+    failed_end, leader_end = mp.Pipe()
+    mp.spawn(train, args=(world_size, model, fault_sim, failed_end, leader_end), nprocs=world_size)
     print("Total faults: ", fault_sim.fault_counter)
