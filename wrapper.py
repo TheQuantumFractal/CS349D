@@ -67,7 +67,9 @@ class DDPNoStop(torch.nn.Module):
         if dist.get_rank() == self.leader:
             if leader_end.poll(timeout=1):
                 # if we have, receive the message, expand the world size, and signal to other nodes to update their dist. 
-                _ = leader_end.recv()
+                test = leader_end.recv()
+                print(test)
+                print('finished receiving')
                 world_size = dist.get_world_size()
                 leader_end.send([world_size])
                                 
@@ -87,12 +89,16 @@ class DDPNoStop(torch.nn.Module):
 
         except: # timeout 
             # one reason for the timeout is if we have a new node:
-            handle = dist.irecv(new_node, src=self.leader, tag=CHECK_NEW_NODE_TOPIC)
-            try:    
-                handle.wait(timeout=timedelta(seconds=self.comm_time))
-                self._update_process_group(dist.get_rank(), world_size + 1)
-            except:
-                # otherwise, a node has failed and we need to start our fault recovery process.
+            if dist.get_rank() != self.leader:
+                handle = dist.irecv(new_node, src=self.leader, tag=CHECK_NEW_NODE_TOPIC)
+                try:    
+                    handle.wait(timeout=timedelta(seconds=self.comm_time))
+                    self._update_process_group(dist.get_rank(), world_size + 1)
+                except:
+                    # only if unsuccessful, something is wrong and run fault recovery
+                    self.fault_recovery()
+            # otherwise, a node has failed and we need to start our fault recovery process.
+            else:
                 self.fault_recovery()
 
     def _update_process_group(self, my_rank, world_size):
