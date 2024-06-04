@@ -12,7 +12,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-
+CHECK_LEADER_HEALTH_TOPIC = 0
+CHECK_FOLLOWER_HEALTH_TOPIC = 1
+CHECK_NEW_NODE_TOPIC = 2
 
 class DDPNoStop(torch.nn.Module):
     """
@@ -59,28 +61,39 @@ class DDPNoStop(torch.nn.Module):
             handle = dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM, async_op=True)
             self.handles.append((handle, param.grad))
     
-    def finish_gradient_synchronization(self, failed_end, leader_end, isFailed):
-        if isFailed:
-            logging.info(f"printing handles:")
-            logging.info(self.handles)
+    def finish_gradient_synchronization(self, leader_end):     
+        # as the leader, check if we've received a message from the newly awaken node
+        new_node = torch.ones(1)
+        if dist.get_rank() == self.leader:
+            if leader_end.poll(timeout=1):
+                # if we have, receive the message, expand the world size, and signal to other nodes to update their dist. 
+                _ = leader_end.recv()
+                world_size = dist.get_world_size()
+                leader_end.send([world_size])
+                                
+                for i in range(world_size):
+                    if i != self.leader:
+                        dist.send(new_node, dst=i, tag=CHECK_NEW_NODE_TOPIC)
+                self._update_process_group(dist.get_rank(), world_size + 1)
+        
+        # synchronize gradients    
         try:
             for handle, grad in reversed(self.handles):
-                if isFailed:
-                    logging.info("waiting")
                 handle.wait()
                 grad /= self.world_size
-            
-            if isFailed:
-                logging.info("clearing")
-            self.handles.clear()
-            if isFailed:
-                logging.info("is barriering")
+
+            self.handles.clear()            
             dist.barrier()
 
-        except: # timeout
-            if isFailed:
-                logging.error("FAULT RECOVERY OF JOE MOTHA")
-            self.fault_recovery(failed_end, leader_end)
+        except: # timeout 
+            # one reason for the timeout is if we have a new node:
+            handle = dist.irecv(new_node, src=self.leader, tag=CHECK_NEW_NODE_TOPIC)
+            try:    
+                handle.wait(timeout=timedelta(seconds=self.comm_time))
+                self._update_process_group(dist.get_rank(), world_size + 1)
+            except:
+                # otherwise, a node has failed and we need to start our fault recovery process.
+                self.fault_recovery()
 
     def _update_process_group(self, my_rank, world_size):
         dist.distributed_c10d.destroy_process_group()
@@ -89,7 +102,7 @@ class DDPNoStop(torch.nn.Module):
         # dist.monitored_barrier(timeout=timedelta(seconds=self.comm_time))
         dist.barrier()
 
-    def fault_recovery(self, failed_end, leader_end):
+    def fault_recovery(self):
         rank = dist.get_rank()
         logging.error(f"Rank {rank} detected a fault. Attempting to recover...")
         world_size = dist.get_world_size()
@@ -102,8 +115,8 @@ class DDPNoStop(torch.nn.Module):
         # while len(ranks) > 1:   # repeat leader election until undead leader is found
         if rank != self.leader:
             try:
-                dist.send(alive, dst=self.leader)
-                handle = dist.irecv(alive, src=self.leader)
+                dist.send(alive, dst=self.leader, tag=CHECK_LEADER_HEALTH_TOPIC)
+                handle = dist.irecv(alive, src=self.leader, tag=CHECK_FOLLOWER_HEALTH_TOPIC)
                 handle.wait(timeout=timedelta(seconds=world_size * self.comm_time))
                 indices = torch.where(alive == 1)[0].tolist()
 
@@ -127,7 +140,7 @@ class DDPNoStop(torch.nn.Module):
             for i in range(dist.get_world_size()):
                 if i != self.leader:
                     try:
-                        handle = dist.irecv(arr_op[i], src=i)
+                        handle = dist.irecv(arr_op[i], src=i, tag=CHECK_LEADER_HEALTH_TOPIC)
                         handles.append(handle)
                     except:
                         # RuntimeError: Connection closed by peer
@@ -149,7 +162,7 @@ class DDPNoStop(torch.nn.Module):
             logging.info(f"I am the leader. I was previously {rank} but I am now {my_rank} with world size {world_size}.")
             for i in indices:
                 if i != self.leader:
-                    dist.send(alive, dst=i)
+                    dist.send(alive, dst=i, tag=CHECK_FOLLOWER_HEALTH_TOPIC)
             self._update_process_group(my_rank, world_size)
         
         logging.info("The system experienced a fault and successfully recovered.")

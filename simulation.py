@@ -17,7 +17,7 @@ import time
 from wrapper import DDPNoStop
 
 WORLD_SIZE = 5
-MAX_ITERS = 100
+MAX_ITERS = 100000
 GLOBAL_P_FAIL = 0.1
 FAULT_SEED = None   # 0 for no faults, None for random seed
 
@@ -74,31 +74,25 @@ def train(rank, world_size, model, fault_sim, failed_end, leader_end):
         output = model(x)
         loss = criterion(output, y)
         loss.backward()
-        model.finish_gradient_synchronization(failed_end, leader_end, False)
+        model.finish_gradient_synchronization(leader_end)
         optimizer.step()
 
     bench_times = []
-    for iter in range(MAX_ITERS):
+    for iter in tqdm(range(MAX_ITERS)):
         start = timeit.default_timer()
         _train_step()
 
-        if rank != 0 and fault_sim(iter):
+        if rank == 2 and fault_sim(iter):
             # simulate a fault
             fault_sim.fault_counter += 1
             logging.error(f"Simulated fault in rank {rank} iteration {iter}.")
             time.sleep(10)
             logging.info('back online, trying train step now')
-            logging.info('running train step')
-            optimizer.zero_grad()
-            logging.info('running model')
-            output = model(x)
-            logging.info('running loss')
-            loss = criterion(output, y)
-            loss.backward()
-            logging.info('finishing gradient sync')
-            model.finish_gradient_synchronization(failed_end, leader_end, True)
-            logging.info('stepping optimizer')
-            optimizer.step()
+            failed_end.send([1])
+            logging.info('finished sending')
+            rank = failed_end.recv()[0] # this node will be the last to be added, hence the world size is rank + 1
+            logging.info('finished receiving')
+            model._update_process_group(rank, rank + 1)
             
         bench_times.append(timeit.default_timer() - start)
     
