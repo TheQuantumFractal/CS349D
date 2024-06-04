@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
+from torch.utils.data import TensorDataset, Subset, DataLoader
 from tqdm import tqdm
 
 from wrapper import DDPNoStop
@@ -22,44 +23,62 @@ from wrapper import DDPNoStop
 logging.basicConfig(level=logging.INFO)
 
 
-class DataLoader:
-    # wrapper class for data loading to our format
-    def __init__(self, train_x, train_y, val_x, val_y, world_size, batch_size):
-        self.train_x = self._split_data(train_x, world_size)
-        self.train_y = self._split_data(train_y, world_size)
-        self.val_x = self._split_data(val_x, world_size)
-        self.val_y = self._split_data(val_y, world_size)
-        self.iter = 0
+import torch
+from torch.utils.data import DataLoader, Subset
+
+
+import torch
+from torch.utils.data import TensorDataset, Subset, DataLoader
+
+
+class DistDataLoader:
+    def __init__(self, train_x, train_y, val_x, val_y, num_splits, batch_size):
+        self.num_splits = num_splits
         self.batch_size = batch_size
+        self.train_len = len(train_x)
+        self.val_len = len(val_x)
 
-    def _split_data(self, data, world_size):
-        # splits data into world_size chunks
-        split_data = np.array_split(data, world_size)
-        return split_data
+        # Create datasets
+        train_dataset = TensorDataset(train_x, train_y)
+        val_dataset = TensorDataset(val_x, val_y)
 
-    def reshape_data(self, dead_nodes):
-        # redistributes data to remaining nodes
-        # TODO: this
-        pass
+        # Split the train dataset into num_splits groups
+        train_indices = list(range(len(train_dataset)))
+        shuffled_indices = torch.randperm(len(train_indices))
+        train_indices = [train_indices[i] for i in shuffled_indices]
+
+        split_sizes = [len(train_indices) // num_splits] * num_splits
+        split_sizes = [
+            size + (1 if i < len(train_indices) % num_splits else 0)
+            for i, size in enumerate(split_sizes)
+        ]
+        split_indices = [sum(split_sizes[:i]) for i in range(num_splits + 1)]
+
+        self.train_split_datasets = [
+            Subset(train_dataset, train_indices[start:end])
+            for start, end in zip(split_indices[:-1], split_indices[1:])
+        ]
+        self.train_split_loaders = [
+            DataLoader(split_dataset, batch_size=batch_size)
+            for split_dataset in self.train_split_datasets
+        ]
+
+        # Create a single DataLoader for the validation dataset
+        self.val_loader = DataLoader(val_dataset, batch_size=batch_size)
 
     def get_batch(self, split, rank, device):
         if split == "train":
-            x = self.train_x
-            y = self.train_y
+            loader = self.train_split_loaders[rank]
         elif split == "val":
-            x = self.val_x
-            y = self.val_y
+            loader = self.val_loader
         else:
-            raise ValueError(f"Invalid split: {split}")
+            raise ValueError(f"Invalid split '{split}'. Expected 'train' or 'val'.")
 
-        x = torch.tensor(x[rank][self.iter : self.iter + self.batch_size], dtype=torch.float32).to(
-            device
-        )
-        y = torch.tensor(y[rank][self.iter : self.iter + self.batch_size], dtype=torch.long).to(
-            device
-        )
-        self.iter += self.batch_size
-        return x, y
+        for batch in loader:
+            X, y = batch
+            X = X.to(device)
+            y = y.to(device)
+            return X, y
 
 
 class FaultSimulator:
@@ -86,7 +105,7 @@ class FaultSimulator:
 
 def _setup_dist(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29500"
+    os.environ["MASTER_PORT"] = "31500"
 
     timeout = timedelta(seconds=200)
     dist.init_process_group("gloo", rank=rank, world_size=world_size, timeout=timeout)
@@ -122,8 +141,10 @@ def train(
     dataloader,
     model,
     optimizer,
+    scheduler,
+    criterion,
     fault_sim,
-    train_iters,
+    num_epochs,
     eval_iters,
     eval_interval,
     output_dir,
@@ -147,7 +168,7 @@ def train(
             project=wandb_project,
             config={
                 "world_size": world_size,
-                "train_iters": train_iters,
+                "num_epochs": num_epochs,
                 "eval_iters": eval_iters,
                 "eval_interval": eval_interval,
                 "p_fail": fault_sim.p_fail,
@@ -155,50 +176,45 @@ def train(
             name=wandb_name,
         )
 
-    # fetch first batch
-    batch_x, batch_y = dataloader.get_batch(
-        "train",
-        rank,
-        device=device,
-    )
+    for epoch in range(num_epochs):
+        for iter in tqdm(range(dataloader.train_len)):
+            batch_x, batch_y = dataloader.get_batch(
+                "train",
+                rank,
+                device=device,
+            )
+            optimizer.zero_grad()
+            output = model(batch_x)
+            loss = criterion(output, batch_y)
+            loss.backward()
+            model.finish_gradient_synchronization()
+            optimizer.step()
 
-    for iter in tqdm(range(train_iters)):
-        optimizer.zero_grad()
-        output = model(batch_x)
-        # async prefetch next batch during forward pass on GPU
-        next_batch_x, next_batch_y = dataloader.get_batch(
-            "train",
-            rank,
-            device=device,
-        )
-        loss = F.cross_entropy(output.view(-1, output.size(-1)), batch_y.view(-1))
-        loss.backward()
-        model.finish_gradient_synchronization()
-        optimizer.step()
+            if rank != 0 and fault_sim(iter):
+                # simulate a fault
+                fault_sim.fault_counter += 1
+                logging.error(f"Simulated fault in rank {rank} iteration {iter}.")
+                os._exit(0)
 
-        if rank != 0 and fault_sim(iter):
-            # simulate a fault
-            fault_sim.fault_counter += 1
-            logging.error(f"Simulated fault in rank {rank} iteration {iter}.")
-            os._exit(0)
+            if is_master_process and iter % 10 == 0 and wandb_project:
+                wandb.log({"train_loss": loss.item()}, step=iter)
 
         if is_master_process and wandb_project:
-            wandb.log({"train_loss": loss.item()}, step=iter)
-
-        if is_master_process and iter != 0 and iter % eval_interval == 0 and wandb_project:
-            val_loss = eval_val_loss(rank, world_size, model, dataloader, eval_iters, device)
+            val_loss = eval_val_loss(
+                rank, world_size, model, dataloader, criterion, eval_iters, device
+            )
             wandb.log({"val_loss": val_loss}, step=iter)
 
-        # update batch
-        batch_x, batch_y = next_batch_x, next_batch_y
+        scheduler.step()
 
     if is_master_process:
         # save model
+        os.makedirs(output_dir, exist_ok=True)
         torch.save(model.module.state_dict(), os.path.join(output_dir, "model.pth"))
 
 
 @torch.no_grad()
-def eval_val_loss(rank, world_size, model, dataloader, eval_iters, device):
+def eval_val_loss(rank, world_size, model, dataloader, criterion, eval_iters, device):
     # assumes that model is already wrapped in DDPNoStop
     model.eval()
     losses = torch.zeros(eval_iters)
@@ -209,7 +225,7 @@ def eval_val_loss(rank, world_size, model, dataloader, eval_iters, device):
             device=device,
         )
         logits = model(batch_x)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), batch_y.view(-1))
+        loss = criterion(logits.view(-1, logits.size(-1)), batch_y.view(-1))
         losses[i] = loss.item()
     model.train()
     return losses.mean()

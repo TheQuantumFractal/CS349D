@@ -1,3 +1,9 @@
+"""
+file: mnist.py
+----------------
+Evaluating trained model quality on MNIST dataset
+"""
+
 import sys
 import os
 import argparse
@@ -6,36 +12,44 @@ import wandb
 import gzip
 import numpy as np
 import torch
+from copy import deepcopy
 import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import datasets, transforms
+from torch.optim.lr_scheduler import StepLR
 import torch.multiprocessing as mp
 
 # add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import wrapper
-from simulation import DataLoader, FaultSimulator, get_adam_optimizer, train
+from simulation import DistDataLoader, FaultSimulator, get_adam_optimizer, train
 
 
-class AlexNet(nn.Module):
-    def __init__(self, num_classes=10):
-        super(AlexNet, self).__init__()
-        self.features = nn.Sequential(
-            nn.Linear(784, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 256),
-            nn.ReLU(inplace=True),
-        )
-        self.classifier = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, num_classes),
-        )
+class Net(nn.Module):
+    # from https://github.com/pytorch/examples/blob/main/mnist/main.py
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, 3, 1)
+        self.conv2 = nn.Conv2d(32, 64, 3, 1)
+        self.dropout1 = nn.Dropout(0.25)
+        self.dropout2 = nn.Dropout(0.5)
+        self.fc1 = nn.Linear(9216, 128)
+        self.fc2 = nn.Linear(128, 10)
 
     def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
-        return x
+        x = self.conv1(x)
+        x = F.relu(x)
+        x = self.conv2(x)
+        x = F.relu(x)
+        x = F.max_pool2d(x, 2)
+        x = self.dropout1(x)
+        x = torch.flatten(x, 1)
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.dropout2(x)
+        x = self.fc2(x)
+        output = F.log_softmax(x, dim=1)
+        return output
 
 
 if __name__ == "__main__":
@@ -61,25 +75,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=10,
+        default=64,  # MNIST is small and simple enough where this is fine
         help=("Batch size to use during training."),
     )
     parser.add_argument(
-        "--train-iters",
-        type=int,
-        default=2000,
-        help="Number of training steps to perform",
+        "--num-epochs",
+        type=float,
+        default=14,
+        help="Number of epochs to train for",
     )
     parser.add_argument(
         "--eval-iters",
         type=int,
-        default=10,
+        default=1000,
         help="Number of evaluation batches to use for calculating validation loss",
     )
     parser.add_argument(
         "--eval-interval",
         type=int,
-        default=50,
+        default=1000,
         help="Measure validation loss every `eval-interval` trainig steps",
     )
     parser.add_argument(
@@ -99,37 +113,32 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    mnist_dataset = {}
-    data_sources = {
-        "training_images": "train-images-idx3-ubyte.gz",  # 60,000 training images.
-        "test_images": "t10k-images-idx3-ubyte.gz",  # 10,000 test images.
-        "training_labels": "train-labels-idx1-ubyte.gz",  # 60,000 training labels.
-        "test_labels": "t10k-labels-idx1-ubyte.gz",  # 10,000 test labels.
-    }
-    for key in ("training_images", "test_images"):
-        with gzip.open(
-            os.path.join(os.path.join(os.path.dirname(__file__), "_data", data_sources[key])), "rb"
-        ) as mnist_file:
-            mnist_dataset[key] = np.frombuffer(mnist_file.read(), np.uint8, offset=16).reshape(
-                -1, 28 * 28
-            )
-    for key in ("training_labels", "test_labels"):
-        with gzip.open(
-            os.path.join(os.path.join(os.path.dirname(__file__), "_data", data_sources[key])), "rb"
-        ) as mnist_file:
-            mnist_dataset[key] = np.frombuffer(mnist_file.read(), np.uint8, offset=8)
+    transform = transforms.Compose(
+        [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
+    )
+    train_set = datasets.MNIST("../data", train=True, download=True, transform=transform)
+    val_set = datasets.MNIST("../data", train=False, transform=transform)
+    train_x, train_y = train_set.data, train_set.targets
+    val_x, val_y = val_set.data, val_set.targets
+    train_x = train_x.unsqueeze(1)  # for single channel
+    val_x = val_x.unsqueeze(1)
+    train_x = train_x.type(torch.float32)
+    train_y = train_y.type(torch.LongTensor)
+    val_x = val_x.type(torch.float32)
+    val_y = val_y.type(torch.LongTensor)
 
-    dataloader = DataLoader(
-        mnist_dataset["training_images"],
-        mnist_dataset["training_labels"],
-        mnist_dataset["test_images"],
-        mnist_dataset["test_labels"],
-        world_size=args.world_size,
+    dataloader = DistDataLoader(
+        train_x,
+        train_y,
+        val_x,
+        val_y,
+        num_splits=args.world_size,
         batch_size=args.batch_size,
     )
 
-    model = AlexNet()
-    optimizer = get_adam_optimizer(model)
+    model = Net()
+    optimizer = torch.optim.Adadelta(model.parameters(), lr=1)
+    scheduler = StepLR(optimizer, step_size=1, gamma=0.7)
     faultsim = FaultSimulator(args.p_fail, seed=0xDEADBEEF)
 
     logging.info("starting training")
@@ -137,12 +146,14 @@ if __name__ == "__main__":
         train,
         args=(
             args.world_size,
-            dataloader,
-            model,
-            optimizer,
+            deepcopy(dataloader),
+            deepcopy(model),
+            deepcopy(optimizer),
+            deepcopy(scheduler),
+            nn.NLLLoss(reduction="sum"),
             faultsim,
-            args.train_iters,
-            args.eval_iters,
+            args.num_epochs,
+            dataloader.val_len,
             args.eval_interval,
             args.output_dir,
             args.wandb_project,

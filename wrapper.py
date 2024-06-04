@@ -24,14 +24,14 @@ class DDPNoStop(torch.nn.Module):
         self.leader = 0
         self.broadcast_params(async_op=True)
 
-        # register hooks to sync gradients
+        # # register hooks to sync gradients
         for param in self.module.parameters():
             if param.requires_grad:
                 param.register_hook(self._sync_gradients_hook)
         self.handles = []
 
         # adjusts sensitivy of timeout (sec)
-        self.comm_time = 25 * self.benchmark_comm()  # multiply by arbitrary constant
+        self.comm_time = 25000 * self.benchmark_comm()  # multiply by arbitrary constant
 
         dist.barrier()
 
@@ -41,10 +41,10 @@ class DDPNoStop(torch.nn.Module):
 
     def benchmark_comm(self):
         comm_times = []
-        for _ in range(100):
+        temp = torch.zeros(self.module.parameters().__next__().data.shape)
+        for _ in range(20):
             t = time.time()
-            for param in self.module.parameters():
-                dist.all_reduce(param.data, op=dist.ReduceOp.SUM)
+            dist.all_reduce(temp, op=dist.ReduceOp.SUM)
             dist.barrier()
             comm_times.append(time.time() - t)
         return np.mean(comm_times)
@@ -61,10 +61,10 @@ class DDPNoStop(torch.nn.Module):
         try:
             for handle, grad in reversed(self.handles):
                 handle.wait()
-                grad /= self.world_size
+                grad /= dist.get_world_size()
 
-            self.handles.clear()
-            dist.barrier()
+                self.handles.clear()
+                dist.barrier()
 
         except:  # timeout
             self.fault_recovery()
