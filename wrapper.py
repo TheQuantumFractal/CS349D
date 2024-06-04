@@ -13,11 +13,11 @@ import torch
 import torch.distributed as dist
 
 
-
 class DDPNoStop(torch.nn.Module):
     """
     Wrapper around torch.nn.module that syncs gradient in a fault-tolerant manner.
     """
+
     def __init__(self, module):
         super(DDPNoStop, self).__init__()
         self.module = module
@@ -31,9 +31,7 @@ class DDPNoStop(torch.nn.Module):
         self.handles = []
 
         # adjusts sensitivy of timeout (sec)
-        self.comm_time = 25 * self.benchmark_comm() # multiply by arbitrary constant
-        self.comm_time = 5
-        print(self.comm_time)
+        self.comm_time = 25 * self.benchmark_comm()  # multiply by arbitrary constant
 
         dist.barrier()
 
@@ -49,32 +47,37 @@ class DDPNoStop(torch.nn.Module):
                 dist.all_reduce(param.data, op=dist.ReduceOp.SUM)
             dist.barrier()
             comm_times.append(time.time() - t)
-        return np.mean(comm_times) * 1000
+        return np.mean(comm_times)
 
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
-    
+
     def _sync_gradients_hook(self, param):
         if param.grad is not None:
             handle = dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM, async_op=True)
             self.handles.append((handle, param.grad))
-    
+
     def finish_gradient_synchronization(self):
         try:
             for handle, grad in reversed(self.handles):
                 handle.wait()
                 grad /= self.world_size
-            
+
             self.handles.clear()
             dist.barrier()
 
-        except: # timeout
+        except:  # timeout
             self.fault_recovery()
 
     def _update_process_group(self, my_rank, world_size):
         dist.distributed_c10d.destroy_process_group()
         os.environ["MASTER_PORT"] = str(int(os.environ["MASTER_PORT"]) + 1)
-        dist.init_process_group("gloo", rank=my_rank, world_size=world_size, timeout=timedelta(seconds=self.comm_time * world_size))
+        dist.init_process_group(
+            "gloo",
+            rank=my_rank,
+            world_size=world_size,
+            timeout=timedelta(seconds=self.comm_time * world_size),
+        )
         # dist.monitored_barrier(timeout=timedelta(seconds=self.comm_time))
         dist.barrier()
 
@@ -97,20 +100,24 @@ class DDPNoStop(torch.nn.Module):
                 indices = torch.where(alive == 1)[0].tolist()
 
                 # world_size-len(indices) processes have died
-                for i in range(world_size-len(indices)):
-                    ranks.remove(len(ranks)-1)
+                for i in range(world_size - len(indices)):
+                    ranks.remove(len(ranks) - 1)
                     world_size -= 1
                 my_rank = indices.index(rank)
-                logging.info(f"I was previously {rank} but I am now {my_rank} with world size {world_size}.")
+                logging.info(
+                    f"I was previously {rank} but I am now {my_rank} with world size {world_size}."
+                )
                 self._update_process_group(my_rank, world_size)
-            except RuntimeError:    # timeout
+            except RuntimeError:  # timeout
                 # Leader has died. Create new leader
                 world_size -= 1
-                ranks.remove(len(ranks)-1)
+                ranks.remove(len(ranks) - 1)
                 my_rank = rank - 1
-                logging.info(f"The leader has died. I was previously {rank} but I am now {my_rank} with world size {world_size}.")
+                logging.info(
+                    f"The leader has died. I was previously {rank} but I am now {my_rank} with world size {world_size}."
+                )
                 self._update_process_group(my_rank, world_size)
-        else:   # leader branch
+        else:  # leader branch
             arr_op = [torch.zeros(world_size) for _ in range(world_size)]
             handles = []
             for i in range(dist.get_world_size()):
@@ -131,15 +138,17 @@ class DDPNoStop(torch.nn.Module):
             indices = torch.where(alive == 1)[0].tolist()
 
             # world_size-len(indices) processes have died
-            for i in range(world_size-len(indices)):
-                ranks.remove(len(ranks)-1)
+            for i in range(world_size - len(indices)):
+                ranks.remove(len(ranks) - 1)
                 world_size -= 1
-            my_rank = 0   # leader is always rank 0
-            logging.info(f"I am the leader. I was previously {rank} but I am now {my_rank} with world size {world_size}.")
+            my_rank = 0  # leader is always rank 0
+            logging.info(
+                f"I am the leader. I was previously {rank} but I am now {my_rank} with world size {world_size}."
+            )
             for i in indices:
                 if i != self.leader:
                     dist.send(alive, dst=i)
             self._update_process_group(my_rank, world_size)
-        
+
         logging.info("The system experienced a fault and successfully recovered.")
         self.broadcast_params(async_op=True)
