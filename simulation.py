@@ -15,6 +15,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.utils.data import TensorDataset, Subset, DataLoader
 from tqdm import tqdm
+from torch.optim.lr_scheduler import StepLR
 
 from wrapper import DDPNoStop
 
@@ -33,52 +34,83 @@ from torch.utils.data import TensorDataset, Subset, DataLoader
 
 class DistDataLoader:
     def __init__(self, train_x, train_y, val_x, val_y, num_splits, batch_size):
-        self.num_splits = num_splits
+        self.world_size = num_splits
+        self.train_x = self._split_data(train_x, num_splits)
+        self.train_y = self._split_data(train_y, num_splits)
+        self.val_x = self._split_data(val_x, num_splits)
+        self.val_y = self._split_data(val_y, num_splits)
+        self.train_len = self.train_x[0].shape[0]//batch_size
+        self.val_len = self.val_x[0].shape[0]//batch_size
+        self.iter = 0
         self.batch_size = batch_size
-        self.train_len = len(train_x)
-        self.val_len = len(val_x)
 
-        # Create datasets
-        train_dataset = TensorDataset(train_x, train_y)
-        val_dataset = TensorDataset(val_x, val_y)
+    def _split_data(self, data, world_size):
+        # splits data into world_size chunks
+        split_data = np.array_split(data, world_size)
+        return split_data
 
-        # Split the train dataset into num_splits groups
-        train_indices = list(range(len(train_dataset)))
-        shuffled_indices = torch.randperm(len(train_indices))
-        train_indices = [train_indices[i] for i in shuffled_indices]
-
-        split_sizes = [len(train_indices) // num_splits] * num_splits
-        split_sizes = [
-            size + (1 if i < len(train_indices) % num_splits else 0)
-            for i, size in enumerate(split_sizes)
-        ]
-        split_indices = [sum(split_sizes[:i]) for i in range(num_splits + 1)]
-
-        self.train_split_datasets = [
-            Subset(train_dataset, train_indices[start:end])
-            for start, end in zip(split_indices[:-1], split_indices[1:])
-        ]
-        self.train_split_loaders = [
-            DataLoader(split_dataset, batch_size=batch_size)
-            for split_dataset in self.train_split_datasets
-        ]
-
-        # Create a single DataLoader for the validation dataset
-        self.val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    def reshape_data(self, dead_nodes):
+        # redistributes data to remaining nodes
+        # TODO: this
+        pass
 
     def get_batch(self, split, rank, device):
-        if split == "train":
-            loader = self.train_split_loaders[rank]
-        elif split == "val":
-            loader = self.val_loader
-        else:
-            raise ValueError(f"Invalid split '{split}'. Expected 'train' or 'val'.")
+        world_size = dist.get_world_size()
+        if world_size != self.world_size:
+            new_train_x = []
+            old_train_x = []
+            new_train_y = []
+            old_train_y = []
+            for i in self.train_x:
+                new_train_x.append(i[self.iter:])
+                old_train_x.append(i[:self.iter])
+            for i in self.train_y:
+                new_train_y.append(i[self.iter:])
+                old_train_y.append(i[:self.iter])
+            new_train_x = self._split_data(np.concatenate(new_train_x), world_size)
+            old_train_x = self._split_data(np.concatenate(old_train_x), world_size)
+            self.train_x = [np.concatenate((a,b)) for a,b in zip(old_train_x, new_train_x)]
+            new_train_y = self._split_data(np.concatenate(new_train_y), world_size)
+            old_train_y = self._split_data(np.concatenate(old_train_y), world_size)
+            self.train_y = [np.concatenate((a,b)) for a,b in zip(old_train_y, new_train_y)]
 
-        for batch in loader:
-            X, y = batch
-            X = X.to(device)
-            y = y.to(device)
-            return X, y
+            new_val_x = []
+            old_val_x = []
+            new_val_y = []
+            old_val_y = []
+            for i in self.val_x:
+                new_val_x.append(i[self.iter:])
+                old_val_x.append(i[:self.iter])
+            for i in self.val_y:
+                new_val_y.append(i[self.iter:])
+                old_val_y.append(i[:self.iter])
+            new_val_x = self._split_data(np.concatenate(new_val_x), world_size)
+            old_val_x = self._split_data(np.concatenate(old_val_x), world_size)
+            self.val_x = [np.concatenate((a,b)) for a,b in zip(old_val_x, new_val_x)]
+            new_val_y = self._split_data(np.concatenate(new_val_y), world_size)
+            old_val_y = self._split_data(np.concatenate(old_val_y), world_size)
+            self.val_y = [np.concatenate((a,b)) for a,b in zip(old_val_y, new_val_y)]
+            self.iter = 0
+
+        if split == "train":
+            x = self.train_x
+            y = self.train_y
+        elif split == "val":
+            x = self.val_x
+            y = self.val_y
+        else:
+            raise ValueError(f"Invalid split: {split}")
+        if self.iter + self.batch_size > x[rank].shape[0]:
+            self.iter = 0
+
+        x = torch.tensor(x[rank][self.iter : self.iter + self.batch_size], dtype=torch.float32).to(
+            device
+        )
+        y = torch.tensor(y[rank][self.iter : self.iter + self.batch_size], dtype=torch.long).to(
+            device
+        )
+        self.iter += self.batch_size
+        return x, y
 
 
 class FaultSimulator:
@@ -140,8 +172,6 @@ def train(
     world_size,
     dataloader,
     model,
-    optimizer,
-    scheduler,
     criterion,
     fault_sim,
     num_epochs,
@@ -158,6 +188,8 @@ def train(
     """
     device = _setup_dist(rank, world_size)
     model = DDPNoStop(model).to(device)
+    optimizer = torch.optim.Adadelta(model.parameters(), lr=1)
+    scheduler = StepLR(optimizer, step_size=1, gamma=0.7)
     is_master_process = rank == 0
 
     torch.manual_seed(rank)  # for reproducibility

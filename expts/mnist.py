@@ -42,11 +42,11 @@ class Net(nn.Module):
         x = self.conv2(x)
         x = F.relu(x)
         x = F.max_pool2d(x, 2)
-        x = self.dropout1(x)
+        # x = self.dropout1(x)
         x = torch.flatten(x, 1)
         x = self.fc1(x)
         x = F.relu(x)
-        x = self.dropout2(x)
+        # x = self.dropout2(x)
         x = self.fc2(x)
         output = F.log_softmax(x, dim=1)
         return output
@@ -137,8 +137,6 @@ if __name__ == "__main__":
     )
 
     model = Net()
-    optimizer = torch.optim.Adadelta(model.parameters(), lr=1)
-    scheduler = StepLR(optimizer, step_size=1, gamma=0.7)
     faultsim = FaultSimulator(args.p_fail, seed=0xDEADBEEF)
 
     logging.info("starting training")
@@ -148,8 +146,6 @@ if __name__ == "__main__":
             args.world_size,
             deepcopy(dataloader),
             deepcopy(model),
-            deepcopy(optimizer),
-            deepcopy(scheduler),
             nn.NLLLoss(reduction="sum"),
             faultsim,
             args.num_epochs,
