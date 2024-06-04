@@ -32,6 +32,8 @@ class DDPNoStop(torch.nn.Module):
 
         # adjusts sensitivy of timeout (sec)
         self.comm_time = 25 * self.benchmark_comm() # multiply by arbitrary constant
+        self.comm_time = 5
+        print(self.comm_time)
 
         dist.barrier()
 
@@ -71,9 +73,10 @@ class DDPNoStop(torch.nn.Module):
 
     def _update_process_group(self, my_rank, world_size):
         dist.distributed_c10d.destroy_process_group()
-        dist.init_process_group("gloo", rank=my_rank, world_size=world_size, timeout=timedelta(seconds=self.comm_time * world_size))
         os.environ["MASTER_PORT"] = str(int(os.environ["MASTER_PORT"]) + 1)
-        dist.barrier(timeout=timedelta(seconds=self.comm_time))
+        dist.init_process_group("gloo", rank=my_rank, world_size=world_size, timeout=timedelta(seconds=self.comm_time * world_size))
+        # dist.monitored_barrier(timeout=timedelta(seconds=self.comm_time))
+        dist.barrier()
 
     def fault_recovery(self):
         rank = dist.get_rank()
@@ -85,61 +88,58 @@ class DDPNoStop(torch.nn.Module):
         alive = torch.zeros(len(ranks))
         alive[rank] = 1
 
-        while len(ranks) > 1:   # repeat leader election until undead leader is found
-            if rank != self.leader:
-                try:
-                    handle = dist.isend(alive, dst=self.leader)
-                    handle.wait(timeout=timedelta(seconds=self.comm_time))
-                    dist.recv(alive, src=self.leader)
-                    indices = torch.where(alive == 1)[0].tolist()
-
-                    # world_size-len(indices) processes have died
-                    for i in range(world_size-len(indices)):
-                        ranks.remove(len(ranks)-1)
-                        world_size -= 1
-                    my_rank = indices.index(rank)
-                    logging.info(f"I was previously {rank} but I am now {my_rank}.")
-                    self._update_process_group(my_rank, world_size)
-                    break
-                except RuntimeError:    # timeout
-                    # Leader has died. Create new leader
-                    world_size -= 1
-                    ranks.remove(len(ranks)-1)
-                    my_rank = rank - 1
-                    logging.info(f"The leader has died. I was previously {rank} but I am now {my_rank}.")
-                    self._update_process_group(my_rank, world_size)
-            else:   # leader branch
-                arr_op = [torch.zeros(world_size) for _ in range(world_size)]
-                handles = []
-                for i in range(dist.get_world_size()):
-                    if i != self.leader:
-                        try:
-                            handle = dist.irecv(arr_op[i], src=i)
-                            handles.append(handle)
-                        except:
-                            # RuntimeError: Connection closed by peer
-                            continue
-                for handle in handles:
-                    try:
-                        handle.wait(timeout=timedelta(seconds=self.comm_time))
-                    except:
-                        continue
-                for op in arr_op:
-                    alive += op
+        # while len(ranks) > 1:   # repeat leader election until undead leader is found
+        if rank != self.leader:
+            try:
+                dist.send(alive, dst=self.leader)
+                handle = dist.irecv(alive, src=self.leader)
+                handle.wait(timeout=timedelta(seconds=world_size * self.comm_time))
                 indices = torch.where(alive == 1)[0].tolist()
 
                 # world_size-len(indices) processes have died
                 for i in range(world_size-len(indices)):
                     ranks.remove(len(ranks)-1)
                     world_size -= 1
-                my_rank = 0   # leader is always rank 0
-                logging.info(f"I am the leader. I was previously {rank} but I am now {my_rank}.")
-                handles = []
-                for i in indices:
-                    if i != self.leader:
-                        dist.send(alive, dst=i)
+                my_rank = indices.index(rank)
+                logging.info(f"I was previously {rank} but I am now {my_rank} with world size {world_size}.")
                 self._update_process_group(my_rank, world_size)
-                break
+            except RuntimeError:    # timeout
+                # Leader has died. Create new leader
+                world_size -= 1
+                ranks.remove(len(ranks)-1)
+                my_rank = rank - 1
+                logging.info(f"The leader has died. I was previously {rank} but I am now {my_rank} with world size {world_size}.")
+                self._update_process_group(my_rank, world_size)
+        else:   # leader branch
+            arr_op = [torch.zeros(world_size) for _ in range(world_size)]
+            handles = []
+            for i in range(dist.get_world_size()):
+                if i != self.leader:
+                    try:
+                        handle = dist.irecv(arr_op[i], src=i)
+                        handles.append(handle)
+                    except:
+                        # RuntimeError: Connection closed by peer
+                        continue
+            for handle in handles:
+                try:
+                    handle.wait(timeout=timedelta(seconds=self.comm_time))
+                except:
+                    continue
+            for op in arr_op:
+                alive += op
+            indices = torch.where(alive == 1)[0].tolist()
+
+            # world_size-len(indices) processes have died
+            for i in range(world_size-len(indices)):
+                ranks.remove(len(ranks)-1)
+                world_size -= 1
+            my_rank = 0   # leader is always rank 0
+            logging.info(f"I am the leader. I was previously {rank} but I am now {my_rank} with world size {world_size}.")
+            for i in indices:
+                if i != self.leader:
+                    dist.send(alive, dst=i)
+            self._update_process_group(my_rank, world_size)
         
         logging.info("The system experienced a fault and successfully recovered.")
         self.broadcast_params(async_op=True)

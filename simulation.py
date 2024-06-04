@@ -81,7 +81,7 @@ def train(rank, world_size, model, fault_sim):
         start = timeit.default_timer()
         _train_step()
 
-        if fault_sim(iter):
+        if rank != 0 and fault_sim(iter):
             # simulate a fault
             fault_sim.fault_counter += 1
             logging.error(f"Simulated fault in rank {rank} iteration {iter}.")
