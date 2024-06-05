@@ -207,7 +207,7 @@ def train(
             },
             name=wandb_name,
         )
-
+    model.train()
     for epoch in range(num_epochs):
         for iter in tqdm(range(dataloader.train_len)):
             batch_x, batch_y = dataloader.get_batch(
@@ -219,6 +219,10 @@ def train(
             output = model(batch_x)
             loss = criterion(output, batch_y)
             loss.backward()
+
+            for param in model.parameters():
+                if param.grad is not None:
+                    model._sync_gradients_hook(param)
             model.finish_gradient_synchronization()
             optimizer.step()
 

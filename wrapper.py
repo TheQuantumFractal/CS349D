@@ -54,17 +54,21 @@ class DDPNoStop(torch.nn.Module):
 
     def _sync_gradients_hook(self, param):
         if param.grad is not None:
-            handle = dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM, async_op=True)
-            self.handles.append((handle, param.grad))
+            gradient = param.grad / dist.get_world_size()
+            handle = dist.all_reduce(gradient, op=dist.ReduceOp.SUM, async_op=True)
+            self.handles.append((handle, param.grad, gradient))
 
     def finish_gradient_synchronization(self):
         try:
-            for handle, grad in reversed(self.handles):
+            for handle, grad, gradient in reversed(self.handles):
                 handle.wait()
-                grad /= dist.get_world_size()
 
-                self.handles.clear()
-                dist.barrier()
+            dist.barrier()
+
+            for handle, grad, gradient in reversed(self.handles):
+                grad.copy_(gradient)
+
+            self.handles.clear()
 
         except:  # timeout
             self.fault_recovery()
@@ -151,4 +155,11 @@ class DDPNoStop(torch.nn.Module):
             self._update_process_group(my_rank, world_size)
 
         logging.info("The system experienced a fault and successfully recovered.")
-        self.broadcast_params(async_op=True)
+        self.handles.clear()
+
+        for param in self.module.parameters():
+            if param.grad is not None:
+                gradient = param.grad / dist.get_world_size()
+                handle = dist.all_reduce(gradient, op=dist.ReduceOp.SUM, async_op=True)
+                self.handles.append((handle, param.grad, gradient))
+        # self.finish_gradient_synchronization()
