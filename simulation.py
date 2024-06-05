@@ -54,8 +54,9 @@ class DistDataLoader:
         # TODO: this
         pass
 
-    def get_batch(self, split, rank, device):
+    def get_batch(self, split, device):
         world_size = dist.get_world_size()
+        rank = dist.get_rank()
         if world_size != self.world_size:
             new_train_x = []
             old_train_x = []
@@ -212,7 +213,6 @@ def train(
         for iter in tqdm(range(dataloader.train_len)):
             batch_x, batch_y = dataloader.get_batch(
                 "train",
-                rank,
                 device=device,
             )
             optimizer.zero_grad()
