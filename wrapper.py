@@ -11,6 +11,9 @@ from datetime import timedelta
 import numpy as np
 import torch
 import torch.distributed as dist
+import traceback
+import sys
+import gc
 
 
 class DDPNoStop(torch.nn.Module):
@@ -31,7 +34,7 @@ class DDPNoStop(torch.nn.Module):
         self.handles = []
 
         # adjusts sensitivy of timeout (sec)
-        self.comm_time = 25000 * self.benchmark_comm()  # multiply by arbitrary constant
+        self.comm_time = 2500 * self.benchmark_comm()  # multiply by arbitrary constant
 
         dist.barrier()
 
@@ -61,7 +64,7 @@ class DDPNoStop(torch.nn.Module):
     def finish_gradient_synchronization(self):
         try:
             for handle, grad, gradient in reversed(self.handles):
-                handle.wait()
+                handle.wait(timeout=timedelta(seconds=self.comm_time))
 
             dist.barrier()
 
@@ -74,7 +77,20 @@ class DDPNoStop(torch.nn.Module):
             self.fault_recovery()
 
     def _update_process_group(self, my_rank, world_size):
-        dist.distributed_c10d.destroy_process_group()
+        # dist.distributed_c10d.destroy_process_group()
+        # for pg_to_shutdown in sorted(dist.distributed_c10d._world.pg_names, key=lambda x: dist.distributed_c10d._world.pg_names[x], reverse=True):
+        #     dist.distributed_c10d._shutdown_backend(pg_to_shutdown)
+
+        dist.distributed_c10d._update_default_pg(None)
+        dist.distributed_c10d._world.pg_map.clear()
+        dist.distributed_c10d._world.pg_names.clear()
+        dist.distributed_c10d._world.pg_group_ranks.clear()
+        dist.distributed_c10d._world.pg_backend_config.clear()
+        dist.distributed_c10d._world.pg_to_tag.clear()
+        dist.distributed_c10d._world.tags_to_pg.clear()
+        dist.distributed_c10d._world.pg_coalesce_state.clear()
+        # dist.distributed_c10d._world.pg_default_device.clear()
+        dist.distributed_c10d._unregister_all_process_groups()
         os.environ["MASTER_PORT"] = str(int(os.environ["MASTER_PORT"]) + 1)
         dist.init_process_group(
             "gloo",
@@ -89,10 +105,10 @@ class DDPNoStop(torch.nn.Module):
         rank = dist.get_rank()
         logging.error(f"Rank {rank} detected a fault. Attempting to recover...")
         world_size = dist.get_world_size()
-        process_group = dist.distributed_c10d._get_default_group()
-        ranks = dist.get_process_group_ranks(process_group)
+        # process_group = dist.distributed_c10d._get_default_group()
+        # ranks = dist.get_process_group_ranks(process_group)
 
-        alive = torch.zeros(len(ranks))
+        alive = torch.zeros(world_size)
         alive[rank] = 1
 
         # while len(ranks) > 1:   # repeat leader election until undead leader is found
@@ -105,7 +121,7 @@ class DDPNoStop(torch.nn.Module):
 
                 # world_size-len(indices) processes have died
                 for i in range(world_size - len(indices)):
-                    ranks.remove(len(ranks) - 1)
+                    # ranks.remove(len(ranks) - 1)
                     world_size -= 1
                 my_rank = indices.index(rank)
                 logging.info(
@@ -115,7 +131,7 @@ class DDPNoStop(torch.nn.Module):
             except RuntimeError:  # timeout
                 # Leader has died. Create new leader
                 world_size -= 1
-                ranks.remove(len(ranks) - 1)
+                # ranks.remove(len(ranks) - 1)
                 my_rank = rank - 1
                 logging.info(
                     f"The leader has died. I was previously {rank} but I am now {my_rank} with world size {world_size}."
@@ -143,7 +159,7 @@ class DDPNoStop(torch.nn.Module):
 
             # world_size-len(indices) processes have died
             for i in range(world_size - len(indices)):
-                ranks.remove(len(ranks) - 1)
+                # ranks.remove(len(ranks) - 1)
                 world_size -= 1
             my_rank = 0  # leader is always rank 0
             logging.info(
@@ -162,4 +178,4 @@ class DDPNoStop(torch.nn.Module):
                 gradient = param.grad / dist.get_world_size()
                 handle = dist.all_reduce(gradient, op=dist.ReduceOp.SUM, async_op=True)
                 self.handles.append((handle, param.grad, gradient))
-        # self.finish_gradient_synchronization()
+        self.finish_gradient_synchronization()

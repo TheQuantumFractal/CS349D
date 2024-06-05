@@ -92,6 +92,8 @@ class DistDataLoader:
             old_val_y = self._split_data(np.concatenate(old_val_y), world_size)
             self.val_y = [np.concatenate((a,b)) for a,b in zip(old_val_y, new_val_y)]
             self.iter = 0
+            self.train_len = self.train_x[0].shape[0]//self.batch_size
+            self.val_len = self.val_x[0].shape[0]//self.batch_size
 
         if split == "train":
             x = self.train_x
@@ -192,6 +194,7 @@ def train(
     optimizer = torch.optim.Adadelta(model.parameters(), lr=1)
     scheduler = StepLR(optimizer, step_size=1, gamma=0.7)
     is_master_process = rank == 0
+    real_iteration = 0
 
     torch.manual_seed(rank)  # for reproducibility
 
@@ -210,7 +213,11 @@ def train(
         )
     model.train()
     for epoch in range(num_epochs):
-        for iter in tqdm(range(dataloader.train_len)):
+        iteration = 0
+        while iteration < dataloader.train_len:
+            rank = dist.get_rank()
+            if rank == 0:
+                print("Iteration %s" % iteration)
             batch_x, batch_y = dataloader.get_batch(
                 "train",
                 device=device,
@@ -226,20 +233,17 @@ def train(
             model.finish_gradient_synchronization()
             optimizer.step()
 
-            if rank != 0 and fault_sim(iter):
+            if rank == 2 and fault_sim(iteration):
                 # simulate a fault
                 fault_sim.fault_counter += 1
-                logging.error(f"Simulated fault in rank {rank} iteration {iter}.")
+                logging.error(f"Simulated fault in rank {rank} iteration {iteration}.")
                 os._exit(0)
 
-            if is_master_process and iter % 10 == 0 and wandb_project:
-                wandb.log({"train_loss": loss.item()}, step=iter)
+            if is_master_process and iteration % 10 == 0 and wandb_project:
+                wandb.log({"train_loss": loss.item()}, step=real_iteration)
 
-        if is_master_process and wandb_project:
-            val_loss = eval_val_loss(
-                rank, world_size, model, dataloader, criterion, eval_iters, device
-            )
-            wandb.log({"val_loss": val_loss}, step=iter)
+            iteration += 1
+            real_iteration += 1
 
         scheduler.step()
 
