@@ -22,7 +22,7 @@ import torch.multiprocessing as mp
 # add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import wrapper
-from simulation import DistDataLoader, FaultSimulator, get_adam_optimizer, train
+from simulation import DistDataLoader, FaultSimulator, train
 
 
 class Net(nn.Module):
@@ -42,11 +42,11 @@ class Net(nn.Module):
         x = self.conv2(x)
         x = F.relu(x)
         x = F.max_pool2d(x, 2)
-        # x = self.dropout1(x)
+        x = self.dropout1(x)
         x = torch.flatten(x, 1)
         x = self.fc1(x)
         x = F.relu(x)
-        # x = self.dropout2(x)
+        x = self.dropout2(x)
         x = self.fc2(x)
         output = F.log_softmax(x, dim=1)
         return output
@@ -56,6 +56,7 @@ if __name__ == "__main__":
     logging.basicConfig(
         format="%(asctime)s - %(module)s - %(levelname)s - %(message)s",
         level=logging.INFO,
+        handlers=[logging.StreamHandler(), logging.FileHandler("mnist.log")],
     )
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -85,15 +86,9 @@ if __name__ == "__main__":
         help="Number of epochs to train for",
     )
     parser.add_argument(
-        "--eval-iters",
-        type=int,
-        default=1000,
-        help="Number of evaluation batches to use for calculating validation loss",
-    )
-    parser.add_argument(
         "--eval-interval",
         type=int,
-        default=1000,
+        default=100,
         help="Measure validation loss every `eval-interval` trainig steps",
     )
     parser.add_argument(
@@ -127,19 +122,18 @@ if __name__ == "__main__":
     val_x = val_x.type(torch.float32)
     val_y = val_y.type(torch.LongTensor)
 
-    dataloader = DistDataLoader(
-        train_x,
-        train_y,
-        val_x,
-        val_y,
-        num_splits=args.world_size,
-        batch_size=args.batch_size,
-    )
+    data_dict = {
+        "train_x": train_x,
+        "train_y": train_y,
+        "val_x": val_x,
+        "val_y": val_y,
+    }
 
+    dataloader = DistDataLoader(data_dict, args.world_size, args.batch_size)
     model = Net()
     faultsim = FaultSimulator(args.p_fail, seed=0xDEADBEEF)
 
-    logging.info("starting training")
+    logging.info("starting training with configuration: %s", args)
     mp.spawn(
         train,
         args=(
@@ -149,7 +143,6 @@ if __name__ == "__main__":
             nn.NLLLoss(reduction="sum"),
             faultsim,
             args.num_epochs,
-            dataloader.val_len,
             args.eval_interval,
             args.output_dir,
             args.wandb_project,

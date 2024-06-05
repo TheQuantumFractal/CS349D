@@ -6,112 +6,106 @@ Training loop with simulated faults
 
 import os
 import logging
-import json
 from datetime import timedelta
 import wandb
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
+from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import TensorDataset, Subset, DataLoader
 from tqdm import tqdm
-from torch.optim.lr_scheduler import StepLR
 
 from wrapper import DDPNoStop
 
 
-# logging
-logging.basicConfig(level=logging.INFO)
-
-
-import torch
-from torch.utils.data import DataLoader, Subset
-
-
-import torch
-from torch.utils.data import TensorDataset, Subset, DataLoader
-
-
 class DistDataLoader:
-    def __init__(self, train_x, train_y, val_x, val_y, num_splits, batch_size):
-        self.world_size = num_splits
+    def __init__(self, data_dict, world_size, batch_size):
+        self.world_size = world_size
+        self.data_dict = data_dict
+        self.batch_size = batch_size
+        self.init_from_dict(world_size)
+
+    def init_from_dict(self, num_splits):
+        # resets to saved original data
+        train_x, train_y, val_x, val_y = (
+            # make copies
+            self.data_dict["train_x"].clone().detach(),
+            self.data_dict["train_y"].clone().detach(),
+            self.data_dict["val_x"].clone().detach(),
+            self.data_dict["val_y"].clone().detach(),
+        )
+        self.train_len = len(train_x)
+        self.eval_len = len(val_x)
         self.train_x = self._split_data(train_x, num_splits)
         self.train_y = self._split_data(train_y, num_splits)
-        self.val_x = self._split_data(val_x, num_splits)
-        self.val_y = self._split_data(val_y, num_splits)
-        self.train_len = self.train_x[0].shape[0]//batch_size
-        self.val_len = self.val_x[0].shape[0]//batch_size
-        self.iter = 0
-        self.batch_size = batch_size
+        # only leader runs on eval set
+        self.val_x = val_x
+        self.val_y = val_y
+
+        self.last_iter = 0  # last iter we split data on
+        self.reset_loaders()
+
+    def get_train_len(self):
+        return len(self.train_x[0])
+
+    def get_eval_len(self):
+        return self.eval_len
 
     def _split_data(self, data, world_size):
         # splits data into world_size chunks
-        split_data = np.array_split(data, world_size)
+        split_data = torch.split(data, data.shape[0] // world_size)
         return split_data
 
-    def reshape_data(self, dead_nodes):
-        # redistributes data to remaining nodes
-        # TODO: this
-        pass
+    def reset_loaders(self):
+        self.train_loaders = [
+            DataLoader(
+                TensorDataset(torch.tensor(self.train_x[rank]), torch.tensor(self.train_y[rank])),
+                batch_size=self.batch_size,
+            )
+            for rank in range(self.world_size)
+        ]
+        self.val_loader = DataLoader(
+            TensorDataset(torch.tensor(self.val_x), torch.tensor(self.val_y)),
+            batch_size=self.batch_size,
+        )
 
-    def get_batch(self, split, device):
+    def resplit(self, curr_iter):
+        # checks if the world size has changed and re-splits data if necessary
         world_size = dist.get_world_size()
-        rank = dist.get_rank()
-        if world_size != self.world_size:
+        if world_size < self.world_size:
+            iter_diff = curr_iter - self.last_iter
+            # re-split data
             new_train_x = []
-            old_train_x = []
             new_train_y = []
-            old_train_y = []
-            for i in self.train_x:
-                new_train_x.append(i[self.iter:])
-                old_train_x.append(i[:self.iter])
-            for i in self.train_y:
-                new_train_y.append(i[self.iter:])
-                old_train_y.append(i[:self.iter])
-            new_train_x = self._split_data(np.concatenate(new_train_x), world_size)
-            old_train_x = self._split_data(np.concatenate(old_train_x), world_size)
-            self.train_x = [np.concatenate((a,b)) for a,b in zip(old_train_x, new_train_x)]
-            new_train_y = self._split_data(np.concatenate(new_train_y), world_size)
-            old_train_y = self._split_data(np.concatenate(old_train_y), world_size)
-            self.train_y = [np.concatenate((a,b)) for a,b in zip(old_train_y, new_train_y)]
+            for i in range(world_size):
+                # get unprocessed data
+                new_train_x.append(self.train_x[i][iter_diff:])
+                new_train_y.append(self.train_y[i][iter_diff:])
+            # split the remaining data evenly among the new ranks
+            for i in range(self.world_size, world_size):
+                new_train_x_split = torch.split(self.train_x[i][iter_diff:], world_size)
+                new_train_y_split = torch.split(self.train_y[i][iter_diff:], world_size)
+                # concat the new data with the old data
+                for j in range(world_size):
+                    new_train_x[j] = torch.cat((self.train_x[j], new_train_x_split[j]))
+                    new_train_y[j] = torch.cat((self.train_y[j], new_train_y_split[j]))
 
-            new_val_x = []
-            old_val_x = []
-            new_val_y = []
-            old_val_y = []
-            for i in self.val_x:
-                new_val_x.append(i[self.iter:])
-                old_val_x.append(i[:self.iter])
-            for i in self.val_y:
-                new_val_y.append(i[self.iter:])
-                old_val_y.append(i[:self.iter])
-            new_val_x = self._split_data(np.concatenate(new_val_x), world_size)
-            old_val_x = self._split_data(np.concatenate(old_val_x), world_size)
-            self.val_x = [np.concatenate((a,b)) for a,b in zip(old_val_x, new_val_x)]
-            new_val_y = self._split_data(np.concatenate(new_val_y), world_size)
-            old_val_y = self._split_data(np.concatenate(old_val_y), world_size)
-            self.val_y = [np.concatenate((a,b)) for a,b in zip(old_val_y, new_val_y)]
-            self.iter = 0
+            self.train_x = new_train_x
+            self.train_y = new_train_y
+            self.world_size = world_size
+            self.last_iter = curr_iter
+            return True  # if True, data was resplit and should be reinitialized
+        return False
 
+    def get_batch(self, split, rank, device):
         if split == "train":
-            x = self.train_x
-            y = self.train_y
+            train_x, train_y = next(iter(self.train_loaders[rank]))
+            return train_x.to(device), train_y.to(device)
         elif split == "val":
-            x = self.val_x
-            y = self.val_y
+            val_x, val_y = next(iter(self.val_loader))
+            return val_x.to(device), val_y.to(device)
         else:
-            raise ValueError(f"Invalid split: {split}")
-        if self.iter + self.batch_size > x[rank].shape[0]:
-            self.iter = 0
-
-        x = torch.tensor(x[rank][self.iter : self.iter + self.batch_size], dtype=torch.float32).to(
-            device
-        )
-        y = torch.tensor(y[rank][self.iter : self.iter + self.batch_size], dtype=torch.long).to(
-            device
-        )
-        self.iter += self.batch_size
-        return x, y
+            raise ValueError("Invalid split")
 
 
 class FaultSimulator:
@@ -148,26 +142,6 @@ def _setup_dist(rank, world_size):
     return device
 
 
-def get_adam_optimizer(
-    model, lr=1e-3, weight_decay=0.1, adam_beta1=0.9, adam_beta2=0.98, adam_eps=1e-9
-):
-    # set up and return Adam optimizer
-    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
-    params_to_decay = [p for _, p in param_dict.items() if p.dim() >= 2]
-    params_to_not_decay = [p for _, p in param_dict.items() if p.dim() < 2]
-    optim_groups = [
-        {"params": params_to_decay, "weight_decay": weight_decay},
-        {"params": params_to_not_decay, "weight_decay": 0.0},
-    ]
-    optimizer = torch.optim.AdamW(
-        optim_groups,
-        lr=lr,
-        betas=(adam_beta1, adam_beta2),
-        eps=adam_eps,
-    )
-    return optimizer
-
-
 def train(
     rank,
     world_size,
@@ -176,7 +150,6 @@ def train(
     criterion,
     fault_sim,
     num_epochs,
-    eval_iters,
     eval_interval,
     output_dir,
     wandb_project,
@@ -189,32 +162,31 @@ def train(
     """
     device = _setup_dist(rank, world_size)
     model = DDPNoStop(model).to(device)
+    # optimizer has references to model so need to init within process
     optimizer = torch.optim.Adadelta(model.parameters(), lr=1)
     scheduler = StepLR(optimizer, step_size=1, gamma=0.7)
-    is_master_process = rank == 0
 
     torch.manual_seed(rank)  # for reproducibility
 
-    if is_master_process and wandb_project:
+    # master has rank 0
+    if (rank == 0) and wandb_project:
         wandb.login()
         wandb.init(
             project=wandb_project,
             config={
                 "world_size": world_size,
                 "num_epochs": num_epochs,
-                "eval_iters": eval_iters,
-                "eval_interval": eval_interval,
                 "p_fail": fault_sim.p_fail,
             },
             name=wandb_name,
         )
+
     model.train()
-    for epoch in range(num_epochs):
-        for iter in tqdm(range(dataloader.train_len)):
-            batch_x, batch_y = dataloader.get_batch(
-                "train",
-                device=device,
-            )
+
+    for epoch in tqdm(range(num_epochs)):
+        dataloader.init_from_dict(world_size)
+        for iter in range(dataloader.get_train_len()):
+            batch_x, batch_y = dataloader.get_batch("train", rank, device)
             optimizer.zero_grad()
             output = model(batch_x)
             loss = criterion(output, batch_y)
@@ -226,40 +198,44 @@ def train(
             model.finish_gradient_synchronization()
             optimizer.step()
 
+            # if faulted and world size changes, re-split train loader
+            if dataloader.resplit(iter):
+                rank = dist.get_rank()  # rank may have changed
+                world_size = dist.get_world_size()
+                dataloader.reset_loaders()
+
             if rank != 0 and fault_sim(iter):
                 # simulate a fault
                 fault_sim.fault_counter += 1
-                logging.error(f"Simulated fault in rank {rank} iteration {iter}.")
+                logging.info(f"Simulated fault in rank {rank} iteration {iter}.")
+                # log fault so it plot
                 os._exit(0)
 
-            if is_master_process and iter % 10 == 0 and wandb_project:
-                wandb.log({"train_loss": loss.item()}, step=iter)
+            if (rank == 0) and iter % 10 == 0 and wandb_project:
+                wandb.log(
+                    {"train_loss": loss.item()}, step=iter + epoch * dataloader.get_train_len()
+                )
 
-        if is_master_process and wandb_project:
-            val_loss = eval_val_loss(
-                rank, world_size, model, dataloader, criterion, eval_iters, device
-            )
-            wandb.log({"val_loss": val_loss}, step=iter)
+        if (rank == 0) and wandb_project:
+            val_loss = eval_val_loss(rank, world_size, model, dataloader, criterion, device)
+            logging.info(f"epoch {epoch+1} val_loss: {val_loss}")
+            wandb.log({"val_loss": val_loss}, step=epoch + 1)
 
         scheduler.step()
 
-    if is_master_process:
+    if rank == 0:
         # save model
         os.makedirs(output_dir, exist_ok=True)
         torch.save(model.module.state_dict(), os.path.join(output_dir, "model.pth"))
 
 
 @torch.no_grad()
-def eval_val_loss(rank, world_size, model, dataloader, criterion, eval_iters, device):
+def eval_val_loss(rank, world_size, model, dataloader, criterion, device):
     # assumes that model is already wrapped in DDPNoStop
     model.eval()
-    losses = torch.zeros(eval_iters)
-    for i in range(eval_iters):
-        batch_x, batch_y = dataloader.get_batch(
-            "val",
-            rank,
-            device=device,
-        )
+    losses = torch.zeros(dataloader.get_eval_len())
+    for i in range(dataloader.get_eval_len()):
+        batch_x, batch_y = dataloader.get_batch("val", rank, device)
         logits = model(batch_x)
         loss = criterion(logits.view(-1, logits.size(-1)), batch_y.view(-1))
         losses[i] = loss.item()
