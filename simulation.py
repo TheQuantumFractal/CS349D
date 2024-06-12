@@ -70,6 +70,7 @@ def train(
     output_dir,
     wandb_project,
     wandb_name,
+    memory_efficient=False,
 ):
     """
     boilerplate training loop
@@ -91,6 +92,9 @@ def train(
             {"params": params_to_not_decay, "weight_decay": 0.0},
         ]
         optimizer = torch.optim.AdamW(optim_groups, lr=1e-3, betas=(0.9, 0.98), eps=1e-9)
+    elif optimizer_str == "RMSProp":
+        # less memory than Adam
+        optimizer = torch.optim.RMSprop(model.parameters(), lr=1e-3)
     else:
         raise ValueError(f"Unrecognized optimizer class: {optimizer_str}")
 
@@ -137,7 +141,8 @@ def train(
                 if param.grad is not None:
                     model._sync_gradients_hook(param)
             model.finish_gradient_synchronization()
-            torch.cuda.empty_cache()
+            if memory_efficient:
+                torch.cuda.empty_cache()
             optimizer.step()
 
             if fault_sim(iter):
@@ -160,7 +165,9 @@ def train(
                     logging.info(f"Epoch {epoch}, iteration {iter+1}, val_loss: {val_loss}")
                     wandb.log({"val_loss": val_loss}, step=real_iteration)
 
-            torch.cuda.empty_cache()  # prevent memory errors
+            if memory_efficient:
+                torch.cuda.empty_cache()
+                del batch_x, batch_y, output, loss
 
             real_iteration += 1
 

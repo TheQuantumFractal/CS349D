@@ -228,11 +228,16 @@ class TransformerLM(nn.Module):
             eos_token_id: int
                 If provided, stop generation when we generate this ID.
 
-        Returns: A LongTensor of shape (max_new_tokens,) with the generated model output.
+        Returns:
+            A tuple containing:
+                - A LongTensor of shape (max_new_tokens,) with the generated model output.
+                - A float representing the perplexity of the generated output.
         """
         if x.dim() == 1:
             x = x.unsqueeze(0)
         original_sequence_length = x.size(-1)
+        generated_probs = []  # for perplexity computation
+
         for _ in range(max_new_tokens):
             # Take the last `context_length` tokens if the input is
             # beyond the model's context length
@@ -255,12 +260,27 @@ class TransformerLM(nn.Module):
                 temperature_scaled_next_token_logits.masked_fill(topk_mask, float("-inf"))
             next_token_probabilities = F.softmax(temperature_scaled_next_token_logits, dim=-1)
             next_token_id = torch.multinomial(next_token_probabilities, 1)
+
+            chosen_prob = next_token_probabilities[0, next_token_id].item()
+            generated_probs.append(chosen_prob)
+
             # End generation if we see the EOS token ID
             if eos_token_id is not None and next_token_id.item() == eos_token_id:
                 break
             x = torch.cat((x, next_token_id), dim=-1)
+
         new_token_ids = x[:, original_sequence_length:]
-        return new_token_ids
+
+        # Calculate perplexity
+        if generated_probs:
+            log_probabilities = torch.log(torch.tensor(generated_probs))
+            sum_log_probabilities = torch.sum(log_probabilities)
+            N = len(generated_probs)
+            perplexity = torch.exp(-sum_log_probabilities / N).item()
+        else:
+            perplexity = float("inf")  # Handle edge case where no new tokens are generated
+
+        return new_token_ids, perplexity
 
     @classmethod
     def from_pretrained(cls, pretrained_model_path: str):
@@ -498,7 +518,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eval-interval",
         type=int,
-        default=2000,
+        default=500,
         help="Measure validation loss every `eval-interval` training steps",
     )
 
@@ -533,7 +553,7 @@ if __name__ == "__main__":
             deepcopy(dataloader),
             deepcopy(model),
             F.cross_entropy,
-            "AdamW",
+            "RMSProp",
             "Cosine",
             faultsim,
             args.num_epochs,
@@ -542,6 +562,7 @@ if __name__ == "__main__":
             OUTPUT_DIR,
             "flexitrain",
             f"llm-p{args.p_fail}",
+            True,
         ),
         nprocs=world_size,
         join=True,
