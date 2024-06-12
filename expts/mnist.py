@@ -15,6 +15,7 @@ import torch
 from copy import deepcopy
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
 import torch.multiprocessing as mp
@@ -22,7 +23,7 @@ import torch.multiprocessing as mp
 # add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import wrapper
-from simulation import DistDataLoader, FaultSimulator, get_adam_optimizer, train
+from simulation import FaultSimulator, train
 
 
 class Net(nn.Module):
@@ -50,6 +51,98 @@ class Net(nn.Module):
         x = self.fc2(x)
         output = F.log_softmax(x, dim=1)
         return output
+
+
+class MNISTDataLoader:
+    def __init__(self, train_x, train_y, val_x, val_y, num_splits, batch_size, shuffle=True):
+        if shuffle:
+            indices = np.random.permutation(len(train_x))
+            train_x = train_x[indices]
+            train_y = train_y[indices]
+            indices = np.random.permutation(len(val_x))
+            val_x = val_x[indices]
+            val_y = val_y[indices]
+
+        self.world_size = num_splits
+        self.train_x = self._split_data(train_x, num_splits)
+        self.train_y = self._split_data(train_y, num_splits)
+        self.val_x = self._split_data(val_x, num_splits)
+        self.val_y = self._split_data(val_y, num_splits)
+        self.train_len = self.train_x[0].shape[0] // batch_size
+        self.val_len = self.val_x[0].shape[0] // batch_size
+        self.iter = 0
+        self.batch_size = batch_size
+
+    def _split_data(self, data, world_size):
+        # splits data into world_size chunks
+        split_data = np.array_split(data, world_size)
+        return split_data
+
+    def reshape_data(self, dead_nodes):
+        # redistributes data to remaining nodes
+        # TODO: this
+        pass
+
+    def get_batch(self, split, device):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        if world_size != self.world_size:
+            new_train_x = []
+            old_train_x = []
+            new_train_y = []
+            old_train_y = []
+            for i in self.train_x:
+                new_train_x.append(i[self.iter :])
+                old_train_x.append(i[: self.iter])
+            for i in self.train_y:
+                new_train_y.append(i[self.iter :])
+                old_train_y.append(i[: self.iter])
+            new_train_x = self._split_data(np.concatenate(new_train_x), world_size)
+            old_train_x = self._split_data(np.concatenate(old_train_x), world_size)
+            self.train_x = [np.concatenate((a, b)) for a, b in zip(old_train_x, new_train_x)]
+            new_train_y = self._split_data(np.concatenate(new_train_y), world_size)
+            old_train_y = self._split_data(np.concatenate(old_train_y), world_size)
+            self.train_y = [np.concatenate((a, b)) for a, b in zip(old_train_y, new_train_y)]
+
+            new_val_x = []
+            old_val_x = []
+            new_val_y = []
+            old_val_y = []
+            for i in self.val_x:
+                new_val_x.append(i[self.iter :])
+                old_val_x.append(i[: self.iter])
+            for i in self.val_y:
+                new_val_y.append(i[self.iter :])
+                old_val_y.append(i[: self.iter])
+            new_val_x = self._split_data(np.concatenate(new_val_x), world_size)
+            old_val_x = self._split_data(np.concatenate(old_val_x), world_size)
+            self.val_x = [np.concatenate((a, b)) for a, b in zip(old_val_x, new_val_x)]
+            new_val_y = self._split_data(np.concatenate(new_val_y), world_size)
+            old_val_y = self._split_data(np.concatenate(old_val_y), world_size)
+            self.val_y = [np.concatenate((a, b)) for a, b in zip(old_val_y, new_val_y)]
+            self.iter = 0
+            self.train_len = self.train_x[0].shape[0] // self.batch_size
+            self.val_len = self.val_x[0].shape[0] // self.batch_size
+
+        if split == "train":
+            x = self.train_x
+            y = self.train_y
+        elif split == "val":
+            x = self.val_x
+            y = self.val_y
+        else:
+            raise ValueError(f"Invalid split: {split}")
+        if self.iter + self.batch_size > x[rank].shape[0]:
+            self.iter = 0
+
+        x = torch.tensor(x[rank][self.iter : self.iter + self.batch_size], dtype=torch.float32).to(
+            device
+        )
+        y = torch.tensor(y[rank][self.iter : self.iter + self.batch_size], dtype=torch.long).to(
+            device
+        )
+        self.iter += self.batch_size
+        return x, y
 
 
 if __name__ == "__main__":
@@ -127,7 +220,7 @@ if __name__ == "__main__":
     val_x = val_x.type(torch.float32)
     val_y = val_y.type(torch.LongTensor)
 
-    dataloader = DistDataLoader(
+    dataloader = MNISTDataLoader(
         train_x,
         train_y,
         val_x,
@@ -147,6 +240,8 @@ if __name__ == "__main__":
             deepcopy(dataloader),
             deepcopy(model),
             nn.NLLLoss(reduction="sum"),
+            "Adadelta",
+            "StepLR",
             faultsim,
             args.num_epochs,
             dataloader.val_len,

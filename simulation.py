@@ -6,114 +6,19 @@ Training loop with simulated faults
 
 import os
 import logging
-import json
-from datetime import timedelta
 import wandb
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
-from torch.utils.data import TensorDataset, Subset, DataLoader
+from datetime import timedelta
 from tqdm import tqdm
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import StepLR, CosineAnnealingLR
 
 from wrapper import DDPNoStop
 
 
 # logging
 logging.basicConfig(level=logging.INFO)
-
-
-import torch
-from torch.utils.data import DataLoader, Subset
-
-
-import torch
-from torch.utils.data import TensorDataset, Subset, DataLoader
-
-
-class DistDataLoader:
-    def __init__(self, train_x, train_y, val_x, val_y, num_splits, batch_size):
-        self.world_size = num_splits
-        self.train_x = self._split_data(train_x, num_splits)
-        self.train_y = self._split_data(train_y, num_splits)
-        self.val_x = self._split_data(val_x, num_splits)
-        self.val_y = self._split_data(val_y, num_splits)
-        self.train_len = self.train_x[0].shape[0]//batch_size
-        self.val_len = self.val_x[0].shape[0]//batch_size
-        self.iter = 0
-        self.batch_size = batch_size
-
-    def _split_data(self, data, world_size):
-        # splits data into world_size chunks
-        split_data = np.array_split(data, world_size)
-        return split_data
-
-    def reshape_data(self, dead_nodes):
-        # redistributes data to remaining nodes
-        # TODO: this
-        pass
-
-    def get_batch(self, split, device):
-        world_size = dist.get_world_size()
-        rank = dist.get_rank()
-        if world_size != self.world_size:
-            new_train_x = []
-            old_train_x = []
-            new_train_y = []
-            old_train_y = []
-            for i in self.train_x:
-                new_train_x.append(i[self.iter:])
-                old_train_x.append(i[:self.iter])
-            for i in self.train_y:
-                new_train_y.append(i[self.iter:])
-                old_train_y.append(i[:self.iter])
-            new_train_x = self._split_data(np.concatenate(new_train_x), world_size)
-            old_train_x = self._split_data(np.concatenate(old_train_x), world_size)
-            self.train_x = [np.concatenate((a,b)) for a,b in zip(old_train_x, new_train_x)]
-            new_train_y = self._split_data(np.concatenate(new_train_y), world_size)
-            old_train_y = self._split_data(np.concatenate(old_train_y), world_size)
-            self.train_y = [np.concatenate((a,b)) for a,b in zip(old_train_y, new_train_y)]
-
-            new_val_x = []
-            old_val_x = []
-            new_val_y = []
-            old_val_y = []
-            for i in self.val_x:
-                new_val_x.append(i[self.iter:])
-                old_val_x.append(i[:self.iter])
-            for i in self.val_y:
-                new_val_y.append(i[self.iter:])
-                old_val_y.append(i[:self.iter])
-            new_val_x = self._split_data(np.concatenate(new_val_x), world_size)
-            old_val_x = self._split_data(np.concatenate(old_val_x), world_size)
-            self.val_x = [np.concatenate((a,b)) for a,b in zip(old_val_x, new_val_x)]
-            new_val_y = self._split_data(np.concatenate(new_val_y), world_size)
-            old_val_y = self._split_data(np.concatenate(old_val_y), world_size)
-            self.val_y = [np.concatenate((a,b)) for a,b in zip(old_val_y, new_val_y)]
-            self.iter = 0
-            self.train_len = self.train_x[0].shape[0]//self.batch_size
-            self.val_len = self.val_x[0].shape[0]//self.batch_size
-
-        if split == "train":
-            x = self.train_x
-            y = self.train_y
-        elif split == "val":
-            x = self.val_x
-            y = self.val_y
-        else:
-            raise ValueError(f"Invalid split: {split}")
-        if self.iter + self.batch_size > x[rank].shape[0]:
-            self.iter = 0
-
-        x = torch.tensor(x[rank][self.iter : self.iter + self.batch_size], dtype=torch.float32).to(
-            device
-        )
-        y = torch.tensor(y[rank][self.iter : self.iter + self.batch_size], dtype=torch.long).to(
-            device
-        )
-        self.iter += self.batch_size
-        return x, y
 
 
 class FaultSimulator:
@@ -150,32 +55,14 @@ def _setup_dist(rank, world_size):
     return device
 
 
-def get_adam_optimizer(
-    model, lr=1e-3, weight_decay=0.1, adam_beta1=0.9, adam_beta2=0.98, adam_eps=1e-9
-):
-    # set up and return Adam optimizer
-    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
-    params_to_decay = [p for _, p in param_dict.items() if p.dim() >= 2]
-    params_to_not_decay = [p for _, p in param_dict.items() if p.dim() < 2]
-    optim_groups = [
-        {"params": params_to_decay, "weight_decay": weight_decay},
-        {"params": params_to_not_decay, "weight_decay": 0.0},
-    ]
-    optimizer = torch.optim.AdamW(
-        optim_groups,
-        lr=lr,
-        betas=(adam_beta1, adam_beta2),
-        eps=adam_eps,
-    )
-    return optimizer
-
-
 def train(
     rank,
     world_size,
     dataloader,
     model,
     criterion,
+    optimizer_str,
+    scheduler_str,
     fault_sim,
     num_epochs,
     eval_iters,
@@ -190,11 +77,30 @@ def train(
     Assumes dataloader is a DataLoader object with get_batch method
     """
     device = _setup_dist(rank, world_size)
+    os.makedirs(output_dir, exist_ok=True)
     model = DDPNoStop(model).to(device)
-    optimizer = torch.optim.Adadelta(model.parameters(), lr=1)
-    scheduler = StepLR(optimizer, step_size=1, gamma=0.7)
+
+    if optimizer_str == "Adadelta":
+        optimizer = torch.optim.Adadelta(model.parameters(), lr=1)
+    elif optimizer_str == "AdamW":
+        param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
+        params_to_decay = [p for _, p in param_dict.items() if p.dim() >= 2]
+        params_to_not_decay = [p for _, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {"params": params_to_decay, "weight_decay": 0.1},
+            {"params": params_to_not_decay, "weight_decay": 0.0},
+        ]
+        optimizer = torch.optim.AdamW(optim_groups, lr=1e-3, betas=(0.9, 0.98), eps=1e-9)
+    else:
+        raise ValueError(f"Unrecognized optimizer class: {optimizer_str}")
+
+    if scheduler_str == "StepLR":
+        scheduler = StepLR(optimizer, step_size=1, gamma=0.7)
+    elif scheduler_str == "Cosine":
+        # scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs)
+        pass
+
     is_master_process = rank == 0
-    real_iteration = 0
 
     torch.manual_seed(rank)  # for reproducibility
 
@@ -211,61 +117,67 @@ def train(
             },
             name=wandb_name,
         )
+
     model.train()
+    real_iteration = 1
+
     for epoch in range(num_epochs):
-        iteration = 0
-        while iteration < dataloader.train_len:
+        for iter in range(dataloader.train_len):
             rank = dist.get_rank()
-            if rank == 0:
-                print("Iteration %s" % iteration)
             batch_x, batch_y = dataloader.get_batch(
                 "train",
                 device=device,
             )
             optimizer.zero_grad()
             output = model(batch_x)
-            loss = criterion(output, batch_y)
+            loss = criterion(output.view(-1, output.size(-1)), batch_y.view(-1))
             loss.backward()
 
             for param in model.parameters():
                 if param.grad is not None:
                     model._sync_gradients_hook(param)
             model.finish_gradient_synchronization()
+            torch.cuda.empty_cache()
             optimizer.step()
 
-            if rank == 2 and fault_sim(iteration):
+            if fault_sim(iter):
                 # simulate a fault
                 fault_sim.fault_counter += 1
-                logging.error(f"Simulated fault in rank {rank} iteration {iteration}.")
+                logging.error(f"Simulated fault in rank {rank} iteration {iter+1}.")
                 os._exit(0)
 
-            if is_master_process and iteration % 10 == 0 and wandb_project:
+            if is_master_process and (iter + 1) % 10 == 0 and wandb_project:
+                logging.info(f"Epoch {epoch}, iteration {iter+1}, loss: {loss.item()}")
                 wandb.log({"train_loss": loss.item()}, step=real_iteration)
 
-            iteration += 1
+            if is_master_process and (iter + 1) % eval_interval == 0:
+                val_loss = eval_val_loss(
+                    rank, world_size, model, dataloader, criterion, eval_iters, device
+                )
+                torch.save(model.module.state_dict(), os.path.join(output_dir, "model.pth"))
+
+                if wandb_project:
+                    logging.info(f"Epoch {epoch}, iteration {iter+1}, val_loss: {val_loss}")
+                    wandb.log({"val_loss": val_loss}, step=real_iteration)
+
+            torch.cuda.empty_cache()  # prevent memory errors
+
             real_iteration += 1
 
-        scheduler.step()
+        # scheduler.step()
 
     if is_master_process:
         # save model
-        os.makedirs(output_dir, exist_ok=True)
         torch.save(model.module.state_dict(), os.path.join(output_dir, "model.pth"))
 
 
 @torch.no_grad()
 def eval_val_loss(rank, world_size, model, dataloader, criterion, eval_iters, device):
-    # assumes that model is already wrapped in DDPNoStop
-    model.eval()
-    losses = torch.zeros(eval_iters)
-    for i in range(eval_iters):
-        batch_x, batch_y = dataloader.get_batch(
-            "val",
-            rank,
-            device=device,
-        )
-        logits = model(batch_x)
-        loss = criterion(logits.view(-1, logits.size(-1)), batch_y.view(-1))
-        losses[i] = loss.item()
-    model.train()
-    return losses.mean()
+    val_loss = 0
+    for _ in tqdm(range(eval_iters)):
+        batch_x, batch_y = dataloader.get_batch("val", device=device)
+        output = model(batch_x)
+        loss = criterion(output.view(-1, output.size(-1)), batch_y.view(-1))
+        val_loss += loss.item()
+    val_loss /= eval_iters
+    return val_loss
