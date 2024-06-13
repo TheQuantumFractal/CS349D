@@ -1,12 +1,4 @@
-# Elastic Compute
-When training on a single instance, the probability of training run failure in a day is approximately 1e-5. 
-However, scaling laws necessitate exponential increases in compute. Now, if any single GPU fails, training will need to restart.
-Here, the probability of failure becomes $1-(1-p)^{n}$ where $n$ is the number of GPUs and $p$ is the probability 
-of failure for a single GPU. With a compute budget of 10,000 GPUs, and GPU failure probabilities of 1e-5 in a day,
-the probability of failure rises to around 15%. This wastes compute due to the overhead of transferring data to and from
-remote storage as well as the lost iterations between the last checkpoint. To this end, we are building an elastic training 
-framework to enable large language models to never stop training due to hardware failures which we project will yield a reduction of 
-15% in training GPU hours when training on 10,000 GPUs.
+# FlexiTrain
+Abstract: Modern machine learning workloads involve training massive models with billions of parameters across tens of thousands of devices. Failures are inevitable at this scale due to the sheer number of devices and duration of training. Existing methods handle failures by periodically checkpointing the model state at various point throughout training. However, this approach to fault tolerance incurs additional overhead that can significantly reduce training throughput. We present FlexiTrain, a checkpoint-free framework for fault-tolerant, distributed model training. FlexiTrain gracefully handles machine failures by discarding the failed machines, redistributing their training data, and rescaling gradient updates among the remaining nodes. We find that FlexiTrain can improve training throughput by 20% with no observable loss on training quality. We empirically validate our approach by training a vision model and a large language model with simulated faults.
 
-## TODOs
-Make a separate timeout for P2P communication / heartbeats to prevent significant blocking overhead.
+[Paper](./paper.pdf)
