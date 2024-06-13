@@ -114,7 +114,8 @@ class DDPNoStop(torch.nn.Module):
         # while len(ranks) > 1:   # repeat leader election until undead leader is found
         if rank != self.leader:
             try:
-                dist.send(alive, dst=self.leader)
+                handle = dist.isend(alive, dst=self.leader)
+                handle.wait(timeout=timedelta(seconds=self.comm_time))
                 handle = dist.irecv(alive, src=self.leader)
                 handle.wait(timeout=timedelta(seconds=world_size * self.comm_time))
                 indices = torch.where(alive == 1)[0].tolist()
